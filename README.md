@@ -167,6 +167,8 @@ pnpm run build
 
 `KALSHI_MCP_PROFILE=a2` is the explicit compatibility profile for the deployed connector. It keeps the 0.1.2 whole-cent create path, including orders that do not carry `price_ranges`. Do not point the running a2 process at this bundle unless that profile is selected on purpose. The default a1 profile will not place those orders.
 
+The Olga candidate in `src/olga/` is a disabled local preparation. Its launchd document is not a schedule and its program is `/usr/bin/false`. The tick can only return `WAIT` or `STOP`. It does not arm the ledger, read a key, or select the a2 profile. See `docs/olga/`.
+
 The offline bundle ships compiled tests. From the extracted directory, with no install and no network:
 
 ```bash

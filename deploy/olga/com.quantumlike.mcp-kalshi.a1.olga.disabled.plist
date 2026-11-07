@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Review-only disabled launchd document for the Olga a1 candidate.
+  Do not copy this file into ~/Library/LaunchAgents or /Library/LaunchDaemons.
+  Do not bootstrap, load, enable, or kickstart this label.
+  There is no StartInterval and no StartCalendarInterval.
+  The program is /usr/bin/false, so a mistaken load cannot start a1 or change a2.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quantumlike.mcp-kalshi.a1.olga.disabled</string>
+	<key>Disabled</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/false</string>
+	</array>
+</dict>
+</plist>

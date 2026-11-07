@@ -1,5 +1,14 @@
 # @iqai/mcp-kalshi
 
+## 0.1.6
+
+### Patch Changes
+
+- Add a disabled Olga-local a1 candidate. The launchd document is not loaded
+  and its program is `/usr/bin/false`. Durable host, risk, policy, binding,
+  and clock files fail closed. The $5 cap does not reset on profit or restart.
+  Unknown policy decides WAIT. No order path and no a2 change.
+
 ## 0.1.5
 
 ### Patch Changes

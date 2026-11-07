@@ -7,7 +7,7 @@ async function main() {
 	const profile = resolveProfile();
 	const server = new FastMCP({
 		name: "Kalshi MCP Server",
-		version: profile === "a2" ? "0.1.2" : "0.1.5",
+		version: profile === "a2" ? "0.1.2" : "0.1.6",
 	});
 
 	for (const tool of toolsForProfile(profile)) {
