@@ -1,12 +1,9 @@
-import type {
-	AmendOrderRequestActionEnum,
-	AmendOrderRequestSideEnum,
-	CreateOrderRequest,
-	CreateOrderRequestActionEnum,
-	CreateOrderRequestSideEnum,
-	CreateOrderRequestTimeInForceEnum,
-	CreateOrderRequestTypeEnum,
-} from "kalshi-typescript";
+import { randomUUID } from "node:crypto";
+import type { CreateOrderV2Response, OrdersApi } from "kalshi-typescript";
+import {
+	type LegacyCreateInput,
+	toCreateOrderV2,
+} from "./create-order-v2-adapter.js";
 import { KalshiClient } from "./kalshi-client.js";
 
 export interface GetOrdersParams {
@@ -19,26 +16,13 @@ export interface GetOrdersParams {
 	cursor?: string;
 }
 
-export interface CreateOrderParams {
-	ticker: string;
-	side: CreateOrderRequestSideEnum;
-	action: CreateOrderRequestActionEnum;
-	count: number;
-	type?: CreateOrderRequestTypeEnum;
-	yesPrice?: number;
-	noPrice?: number;
-	clientOrderId?: string;
-	expirationTs?: number;
-	timeInForce?: CreateOrderRequestTimeInForceEnum;
-	postOnly?: boolean;
-	reduceOnly?: boolean;
-}
+export interface CreateOrderParams extends LegacyCreateInput {}
 
 export interface AmendOrderParams {
 	orderId: string;
 	ticker: string;
-	side: AmendOrderRequestSideEnum;
-	action: AmendOrderRequestActionEnum;
+	side: "yes" | "no";
+	action: "buy" | "sell";
 	clientOrderId: string;
 	updatedClientOrderId: string;
 	count?: number;
@@ -49,14 +33,27 @@ export interface AmendOrderParams {
 export interface DecreaseOrderParams {
 	orderId: string;
 	reduceBy: number;
+	marketTicker: string;
 }
 
 export interface BatchCreateOrdersParams {
 	orders: CreateOrderParams[];
 }
 
+export interface RoutedOrderId {
+	orderId: string;
+	marketTicker: string;
+}
+
 export interface BatchCancelOrdersParams {
-	ids: string[];
+	orders?: RoutedOrderId[];
+	/** Legacy id-only input. Rejected: V2 cannot route an order id without a market ticker. */
+	ids?: string[];
+}
+
+export interface CancelOrderParams {
+	orderId: string;
+	marketTicker: string;
 }
 
 export interface GetOrderQueuePositionsParams {
@@ -64,13 +61,57 @@ export interface GetOrderQueuePositionsParams {
 	eventTicker?: string;
 }
 
+export class OrderMutationClosedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "OrderMutationClosedError";
+	}
+}
+
+export interface OrdersServiceOptions {
+	ordersApi?: OrdersApi;
+	createClientOrderId?: () => string;
+}
+
+const SHARD_DEFAULT_REFUSAL =
+	"market_ticker is required to auto-route this request. Refusing to default to exchange shard 0.";
+
+function requireText(value: string, label: string): string {
+	if (typeof value !== "string" || value.trim() === "") {
+		throw new Error(`${label} is required`);
+	}
+	return value.trim();
+}
+
+function requireMarketTicker(value: string | undefined): string {
+	if (typeof value !== "string" || value.trim() === "") {
+		throw new Error(SHARD_DEFAULT_REFUSAL);
+	}
+	return value.trim();
+}
+
+function requireWholeCount(value: number, label: string): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+		throw new Error(`${label} must be a whole positive contract count`);
+	}
+	return value;
+}
+
 export class OrdersService {
-	private get client(): KalshiClient {
-		return KalshiClient.getInstance();
+	private readonly ordersApi: OrdersApi | undefined;
+	private readonly createClientOrderId: () => string;
+
+	constructor(options: OrdersServiceOptions = {}) {
+		this.ordersApi = options.ordersApi;
+		this.createClientOrderId = options.createClientOrderId ?? randomUUID;
+	}
+
+	private get orders(): OrdersApi {
+		return this.ordersApi ?? KalshiClient.getInstance().orders;
 	}
 
 	async getOrders(params: GetOrdersParams = {}) {
-		const response = await this.client.orders.getOrders(
+		const response = await this.orders.getOrders(
 			params.ticker,
 			params.eventTicker,
 			params.minTs,
@@ -83,88 +124,82 @@ export class OrdersService {
 	}
 
 	async getOrder(orderId: string) {
-		const response = await this.client.orders.getOrder(orderId);
+		const response = await this.orders.getOrder(orderId);
 		return response.data;
 	}
 
-	async createOrder(params: CreateOrderParams) {
-		const request: CreateOrderRequest = {
-			ticker: params.ticker,
-			side: params.side,
-			action: params.action,
-			count: params.count,
-			type: params.type,
-			yes_price: params.yesPrice,
-			no_price: params.noPrice,
-			client_order_id: params.clientOrderId,
-			expiration_ts: params.expirationTs,
-			time_in_force: params.timeInForce,
-			post_only: params.postOnly,
-			reduce_only: params.reduceOnly,
-		};
-		const response = await this.client.orders.createOrder(request);
+	async createOrder(params: CreateOrderParams): Promise<CreateOrderV2Response> {
+		const validated = toCreateOrderV2(params);
+		const clientOrderId = params.clientOrderId ?? this.createClientOrderId();
+		const request = { ...validated, client_order_id: clientOrderId };
+		// Exactly one SDK call. An unknown outcome is not retried.
+		const response = await this.orders.createOrderV2(request);
 		return response.data;
 	}
 
-	async cancelOrder(orderId: string) {
-		const response = await this.client.orders.cancelOrder(orderId);
+	async cancelOrder(params: CancelOrderParams) {
+		const orderId = requireText(params.orderId, "order id");
+		const marketTicker = requireMarketTicker(params.marketTicker);
+		const response = await this.orders.cancelOrderV2(
+			orderId,
+			undefined,
+			-1,
+			marketTicker,
+		);
 		return response.data;
 	}
 
-	async amendOrder(params: AmendOrderParams) {
-		const response = await this.client.orders.amendOrder(params.orderId, {
-			ticker: params.ticker,
-			side: params.side,
-			action: params.action,
-			client_order_id: params.clientOrderId,
-			updated_client_order_id: params.updatedClientOrderId,
-			count: params.count,
-			yes_price: params.yesPrice,
-			no_price: params.noPrice,
-		});
-		return response.data;
+	async amendOrder(_params: AmendOrderParams): Promise<never> {
+		throw new OrderMutationClosedError(
+			"AMEND_ORDER is fail-closed. V1 amendOrder was removed. V2 count is the filled-plus-resting total, and a wrong mapping can increase size or lose queue position. No amend tool is exposed.",
+		);
 	}
 
 	async decreaseOrder(params: DecreaseOrderParams) {
-		const response = await this.client.orders.decreaseOrder(params.orderId, {
-			reduce_by: params.reduceBy,
+		const orderId = requireText(params.orderId, "order id");
+		const marketTicker = requireMarketTicker(params.marketTicker);
+		const reduceBy = requireWholeCount(params.reduceBy, "reduceBy");
+		const response = await this.orders.decreaseOrderV2(orderId, {
+			reduce_by: reduceBy.toFixed(2),
+			market_ticker: marketTicker,
+			exchange_index: -1,
 		});
 		return response.data;
 	}
 
-	async batchCreateOrders(params: BatchCreateOrdersParams) {
-		const orders = params.orders.map((order) => ({
-			ticker: order.ticker,
-			side: order.side,
-			action: order.action,
-			count: order.count,
-			type: order.type,
-			yes_price: order.yesPrice,
-			no_price: order.noPrice,
-			client_order_id: order.clientOrderId,
-			expiration_ts: order.expirationTs,
-			time_in_force: order.timeInForce,
-			post_only: order.postOnly,
-			reduce_only: order.reduceOnly,
-		}));
-		const response = await this.client.orders.batchCreateOrders({ orders });
-		return response.data;
+	async batchCreateOrders(_params: BatchCreateOrdersParams): Promise<never> {
+		throw new OrderMutationClosedError(
+			"BATCH_CREATE_ORDERS is fail-closed. It is not an exposed tool. CREATE_ORDER submits exactly one order and does not retry.",
+		);
 	}
 
 	async batchCancelOrders(params: BatchCancelOrdersParams) {
-		const response = await this.client.orders.batchCancelOrders({
-			ids: params.ids,
-		});
+		if (!params.orders?.length) {
+			throw new Error(
+				params.ids?.length
+					? `${SHARD_DEFAULT_REFUSAL} Pass orders with orderId and marketTicker instead of ids alone.`
+					: "At least one order is required",
+			);
+		}
+		if (params.orders.length > 20) {
+			throw new Error("Batch cancel accepts at most 20 orders");
+		}
+		const orders = params.orders.map((order) => ({
+			order_id: requireText(order.orderId, "order id"),
+			market_ticker: requireMarketTicker(order.marketTicker),
+			exchange_index: -1 as const,
+		}));
+		const response = await this.orders.batchCancelOrdersV2({ orders });
 		return response.data;
 	}
 
 	async getOrderQueuePosition(orderId: string) {
-		const response = await this.client.orders.getOrderQueuePosition(orderId);
+		const response = await this.orders.getOrderQueuePosition(orderId);
 		return response.data;
 	}
 
 	async getOrderQueuePositions(params: GetOrderQueuePositionsParams = {}) {
-		const response = await this.client.orders.getOrderQueuePositions(
+		const response = await this.orders.getOrderQueuePositions(
 			params.marketTickers,
 			params.eventTicker,
 		);

@@ -14,7 +14,7 @@ By implementing the Model Context Protocol (MCP), this server allows Large Langu
 *   **Market Discovery**: Search and filter prediction markets by status, series, or event keywords.
 *   **Real-time Pricing**: Access live price data, implied probabilities, and depth-of-market (order books) for any market.
 *   **Portfolio Tracking**: Monitor account balance, positions, trade history, fills, and settlements.
-*   **Trading Operations**: Place limit or market orders, cancel orders, and manage positions.
+*   **Trading Operations**: Place one limit order at a time. YES/NO prices in whole cents are mapped onto the YES book. Cancel and decrease require the market ticker. Market orders are rejected. Amend and batch-create stay fail-closed.
 
 ## 📦 Installation
 
@@ -29,7 +29,7 @@ npx @iqai/mcp-kalshi
 ### 🔧 Build from Source
 
 ```bash
-git clone https://github.com/IQAIcom/mcp-kalshi.git
+git clone https://github.com/quantum-like/mcp-kalshi.git
 cd mcp-kalshi
 pnpm install
 pnpm run build
@@ -111,7 +111,7 @@ Add the following configuration to your MCP client settings (e.g., `claude_deskt
 
 ### 📝 Trading
 *   "Place a limit buy order for 10 Yes contracts at 45 cents on [market]"
-*   "Cancel my order with ID [order_id]"
+*   "Cancel order [order_id] on market [ticker]"
 *   "Show me all my resting orders"
 
 ## 🛠️ MCP Tools
@@ -152,11 +152,37 @@ pnpm run build
 pnpm run watch
 ```
 
-### ✅ Linting & Formatting
+### ✅ Linting, tests, and build
 ```bash
 pnpm run lint
-pnpm run format
+pnpm test
+pnpm run build
 ```
+
+`pnpm test` uses a mocked Axios transport. It does not call Kalshi and it does not prove the exchange accepted an order.
+
+## Deploying this fork
+
+This package is the `quantum-like/mcp-kalshi` fork. It is not published to npm. The parent host installs the self-contained offline bundle, which already contains `dist/` and the production `node_modules` resolved from `pnpm-lock.yaml`.
+
+Extract that bundle and point the existing stdio MCP configuration at its server:
+
+```json
+{
+  "command": "node",
+  "args": ["/absolute/path/to/iqai-mcp-kalshi-0.1.2/dist/index.js"],
+  "env": {
+    "KALSHI_API_KEY": "your_api_key_here",
+    "KALSHI_PRIVATE_KEY_PATH": "/absolute/path/to/private-key.pem"
+  }
+}
+```
+
+`KALSHI_PRIVATE_KEY_PEM` can be used instead of `KALSHI_PRIVATE_KEY_PATH`. The base URL stays `https://api.elections.kalshi.com/trade-api/v2`. Swapping this command is an operator step. This repository does not restart a running connector, place an order, or change any schedule.
+
+Pinned production versions inside the bundle: `dedent@1.6.0`, `fastmcp@3.30.1`, `kalshi-typescript@3.35.0`, `zod@3.25.7`, `axios@1.21.0`.
+
+Rollback: point the same MCP configuration back at the previous server binary. Leave any external monitor-only hold in place until that hold is cleared by its own procedure. The pre-repair source revision is `15c12b37ed9f1b0e3fc0000e4918e9191c2b282b`.
 
 ### 📁 Project Structure
 *   `src/tools/`: Individual tool definitions
