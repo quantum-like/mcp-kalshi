@@ -2,6 +2,8 @@
 
 This build does not trade and it does not claim profitability.
 
+External capital introduced stays `5.000000`. Realized profits can be used again. Realized losses and costs reduce what can be reserved. Unrealized profit cannot. No selector has passed FIT, then PREREG, then VALIDATE, then a forward paper period.
+
 ## Implemented
 
 - A durable policy file whose seeded id is `unvalidated`.

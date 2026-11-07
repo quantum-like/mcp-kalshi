@@ -1,11 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { open, readFile, readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
-import { formatMoney, parseMoney } from "../lib/fixed.js";
+import {
+	formatCount,
+	formatMoney,
+	parseCount,
+	parseMoney,
+} from "../lib/fixed.js";
 import { STRATEGY_CAPITAL } from "../strategy/boundary.js";
+import {
+	type BalancePrecision,
+	assertQuadraticFeeType,
+	quoteBuyReservation,
+	reservationFeeUnits,
+} from "../strategy/fees.js";
 
-export const RISK_CAP = STRATEGY_CAPITAL;
-export const OLGA_HOST_ID = "olga";
+/** Maximum money that may be introduced from outside. Realized profit is separate. */
+export const MAX_EXTERNAL_CAPITAL = STRATEGY_CAPITAL;
+export const OLGA_MACHINE_ID = "f79c77c4-4b66-4a92-9669-f49bf82f9e59";
+export const OLGA_HOME = "/Users/olgavlasova";
 export const A1_KEYCHAIN_SERVICE = "mcp-kalshi-a1";
 export const A1_KEYCHAIN_ACCOUNT = "olga-a1";
 export const SEALED_POLICY_IDS: readonly string[] = [];
@@ -33,21 +46,38 @@ export type ReservationState = "held" | "submitting" | "unknown" | "released";
 export interface Reservation {
 	id: string;
 	clientOrderId: string;
+	side: "yes" | "no";
+	action: "buy" | "sell";
+	count: string;
+	price: string;
 	amount: string;
 	state: ReservationState;
 }
 
+export interface ReserveInput {
+	clientOrderId: string;
+	side: "yes" | "no";
+	action: "buy" | "sell";
+	count: string;
+	price: string;
+	feeType: string;
+	feeMultiplier: string;
+	balancePrecision: BalancePrecision;
+}
+
 export interface OwnerRecord {
-	version: 1;
-	hostId: typeof OLGA_HOST_ID;
+	version: 2;
+	machineId: typeof OLGA_MACHINE_ID;
+	home: typeof OLGA_HOME;
 	profile: "a1";
 	fallback: "forbidden";
 }
 
 export interface RiskRecord {
-	version: 1;
+	version: 2;
 	profile: "a1";
-	cap: typeof RISK_CAP;
+	externalCapital: typeof MAX_EXTERNAL_CAPITAL;
+	realizedPnl: string;
 	allocated: string;
 	reservations: Reservation[];
 }
@@ -74,8 +104,9 @@ export interface BindingRecord {
 }
 
 export interface ClockRecord {
-	version: 1;
+	version: 2;
 	lastClockMs: number;
+	lastExchangeMs: number | null;
 	frozen: boolean;
 	freezeReason: string | null;
 }
@@ -110,8 +141,37 @@ function closedGates(): Record<PolicyGate, false> {
 export function allocatedOf(reservations: Reservation[]): bigint {
 	return reservations.reduce((sum, reservation) => {
 		if (reservation.state === "released") return sum;
-		return sum + parseMoney(reservation.amount);
+		return sum + positiveMoney(reservation.amount);
 	}, 0n);
+}
+
+export function spendableUnits(risk: RiskRecord): bigint {
+	return (
+		parseMoney(risk.externalCapital) +
+		finiteMoney(risk.realizedPnl) -
+		allocatedOf(risk.reservations)
+	);
+}
+
+export function feeInclusiveHold(input: ReserveInput): string {
+	assertQuadraticFeeType(input.feeType);
+	if (input.action === "buy") {
+		return quoteBuyReservation({
+			count: input.count,
+			price: input.price,
+			multiplier: input.feeMultiplier,
+			precision: input.balancePrecision,
+			feeType: input.feeType,
+		}).total;
+	}
+	return formatMoney(
+		reservationFeeUnits(
+			input.count,
+			input.price,
+			input.feeMultiplier,
+			input.balancePrecision,
+		),
+	);
 }
 
 export async function initializeDisabledCandidate(
@@ -129,15 +189,17 @@ export async function initializeDisabledCandidate(
 	}
 	const state: OlgaState = {
 		owner: {
-			version: 1,
-			hostId: OLGA_HOST_ID,
+			version: 2,
+			machineId: OLGA_MACHINE_ID,
+			home: OLGA_HOME,
 			profile: "a1",
 			fallback: "forbidden",
 		},
 		risk: {
-			version: 1,
+			version: 2,
 			profile: "a1",
-			cap: RISK_CAP,
+			externalCapital: MAX_EXTERNAL_CAPITAL,
+			realizedPnl: formatMoney(0n),
 			allocated: formatMoney(0n),
 			reservations: [],
 		},
@@ -161,8 +223,9 @@ export async function initializeDisabledCandidate(
 			distinctFromMemberId: null,
 		},
 		clock: {
-			version: 1,
+			version: 2,
 			lastClockMs: nowMs,
+			lastExchangeMs: null,
 			frozen: false,
 			freezeReason: null,
 		},
@@ -172,6 +235,7 @@ export async function initializeDisabledCandidate(
 		profile: "a1",
 		files: STATE_FILES,
 		enabled: false,
+		orders: "disabled",
 	});
 	await writeDurable(directory, OWNER, state.owner);
 	await writeDurable(directory, RISK, state.risk);
@@ -219,8 +283,7 @@ export async function saveRisk(
 	directory: string,
 	risk: RiskRecord,
 ): Promise<void> {
-	const parsed = parseRisk(risk);
-	await writeDurable(directory, RISK, parsed);
+	await writeDurable(directory, RISK, parseRisk(risk));
 }
 
 export async function saveClock(
@@ -237,11 +300,7 @@ export async function saveBinding(
 	await writeDurable(directory, BINDING, parseBinding(binding));
 }
 
-export function reserve(
-	risk: RiskRecord,
-	amount: string,
-	clientOrderId: string,
-): RiskRecord {
+export function reserve(risk: RiskRecord, input: ReserveInput): RiskRecord {
 	const parsed = parseRisk(risk);
 	if (parsed.reservations.some((item) => item.state === "unknown")) {
 		throw new OlgaRefusal(
@@ -250,24 +309,36 @@ export function reserve(
 	}
 	if (parsed.reservations.some((item) => item.state === "submitting")) {
 		throw new OlgaRefusal(
-			"An orphan submitting order is frozen. Refusing a new reservation.",
+			"An in-flight submitting order is frozen. Refusing a new reservation.",
 		);
 	}
-	const units = parseMoney(amount);
-	if (units <= 0n) throw new OlgaRefusal("Reservation must be positive.");
-	const next = allocatedOf(parsed.reservations) + units;
-	if (next > parseMoney(RISK_CAP)) {
+	if (
+		parsed.reservations.some(
+			(item) => item.clientOrderId === input.clientOrderId,
+		)
+	) {
 		throw new OlgaRefusal(
-			"Reservation would exceed the immutable $5 total risk cap.",
+			"Client order id is already reserved. Refusing a duplicate in-flight id.",
 		);
 	}
-	const reservations = [
+	const amount = feeInclusiveHold(input);
+	const units = positiveMoney(amount);
+	if (units > spendableUnits(parsed)) {
+		throw new OlgaRefusal(
+			"Fee-inclusive reservation exceeds spendable bankroll. External capital stays 5.000000.",
+		);
+	}
+	const reservations: Reservation[] = [
 		...parsed.reservations,
 		{
 			id: randomUUID(),
-			clientOrderId,
+			clientOrderId: input.clientOrderId,
+			side: input.side,
+			action: input.action,
+			count: formatCount(parseCount(input.count)),
+			price: formatMoney(parseMoney(input.price)),
 			amount: formatMoney(units),
-			state: "held" as const,
+			state: "held",
 		},
 	];
 	return parseRisk({
@@ -277,26 +348,34 @@ export function reserve(
 	});
 }
 
+export function bookRealized(risk: RiskRecord, delta: string): RiskRecord {
+	const parsed = parseRisk(risk);
+	const next = finiteMoney(parsed.realizedPnl) + finiteMoney(delta);
+	if (finiteMoney(delta) === 0n) {
+		throw new OlgaRefusal("Realized result must be a non-zero finite decimal.");
+	}
+	return parseRisk({ ...parsed, realizedPnl: formatMoney(next) });
+}
+
+export function rejectExternalTopUp(): never {
+	throw new OlgaRefusal(
+		"External capital cannot be topped up, leveraged, or taken from other funds.",
+	);
+}
+
+export function rejectUnrealizedSpend(): never {
+	throw new OlgaRefusal("Unrealized profit is not spendable.");
+}
+
 export function markUnknown(
 	risk: RiskRecord,
 	clientOrderId: string,
 ): RiskRecord {
-	const parsed = parseRisk(risk);
-	let found = false;
-	const reservations = parsed.reservations.map((reservation) => {
-		if (reservation.clientOrderId !== clientOrderId) return reservation;
+	return mapReservation(risk, clientOrderId, (reservation) => {
 		if (reservation.state === "released") {
 			throw new OlgaRefusal("A released reservation cannot become unknown.");
 		}
-		found = true;
-		return { ...reservation, state: "unknown" as const };
-	});
-	if (!found)
-		throw new OlgaRefusal("No reservation matches that client order id.");
-	return parseRisk({
-		...parsed,
-		allocated: formatMoney(allocatedOf(reservations)),
-		reservations,
+		return { ...reservation, state: "unknown" };
 	});
 }
 
@@ -304,23 +383,13 @@ export function markSubmitting(
 	risk: RiskRecord,
 	clientOrderId: string,
 ): RiskRecord {
-	const parsed = parseRisk(risk);
-	let found = false;
-	const reservations = parsed.reservations.map((reservation) => {
-		if (reservation.clientOrderId !== clientOrderId) return reservation;
+	return mapReservation(risk, clientOrderId, (reservation) => {
 		if (reservation.state !== "held") {
 			throw new OlgaRefusal(
 				"Only a held reservation can be marked submitting, and it is not retried.",
 			);
 		}
-		found = true;
-		return { ...reservation, state: "submitting" as const };
-	});
-	if (!found)
-		throw new OlgaRefusal("No held reservation matches that client order id.");
-	return parseRisk({
-		...parsed,
-		reservations,
+		return { ...reservation, state: "submitting" };
 	});
 }
 
@@ -334,10 +403,7 @@ export function releaseUnsent(
 			"Incomplete read. The reservation stays frozen and is not retried.",
 		);
 	}
-	const parsed = parseRisk(risk);
-	let found = false;
-	const reservations = parsed.reservations.map((reservation) => {
-		if (reservation.clientOrderId !== clientOrderId) return reservation;
+	return mapReservation(risk, clientOrderId, (reservation) => {
 		if (reservation.state === "unknown") {
 			throw new OlgaRefusal(
 				"Unknown order outcome stays reserved. Refusing to release or retry it.",
@@ -348,11 +414,25 @@ export function releaseUnsent(
 				"Only an unsent submitting reservation can be released.",
 			);
 		}
-		found = true;
-		return { ...reservation, state: "released" as const };
+		return { ...reservation, state: "released" };
 	});
-	if (!found)
-		throw new OlgaRefusal("No submitting reservation matches that id.");
+}
+
+function mapReservation(
+	risk: RiskRecord,
+	clientOrderId: string,
+	change: (reservation: Reservation) => Reservation,
+): RiskRecord {
+	const parsed = parseRisk(risk);
+	let found = false;
+	const reservations = parsed.reservations.map((reservation) => {
+		if (reservation.clientOrderId !== clientOrderId) return reservation;
+		found = true;
+		return change(reservation);
+	});
+	if (!found) {
+		throw new OlgaRefusal("No reservation matches that client order id.");
+	}
 	return parseRisk({
 		...parsed,
 		allocated: formatMoney(allocatedOf(reservations)),
@@ -360,27 +440,28 @@ export function releaseUnsent(
 	});
 }
 
-export function rejectProfitOrTopUp(): never {
-	throw new OlgaRefusal(
-		"Profits, top-ups, adaptation, and restarts cannot raise or reset the $5 cap.",
-	);
-}
-
 function parseOwner(value: unknown): OwnerRecord {
 	const record = object(value, "owner");
+	if ("hostId" in record) {
+		throw new OlgaRefusal(
+			"A text host label is not a machine binding. No automatic fallback.",
+		);
+	}
 	if (
-		record.version !== 1 ||
-		record.hostId !== OLGA_HOST_ID ||
+		record.version !== 2 ||
+		record.machineId !== OLGA_MACHINE_ID ||
+		record.home !== OLGA_HOME ||
 		record.profile !== "a1" ||
 		record.fallback !== "forbidden"
 	) {
 		throw new OlgaRefusal(
-			"Host ownership does not match Olga a1. No automatic fallback.",
+			"Host ownership does not match the Olga machine. No automatic fallback.",
 		);
 	}
 	return {
-		version: 1,
-		hostId: OLGA_HOST_ID,
+		version: 2,
+		machineId: OLGA_MACHINE_ID,
+		home: OLGA_HOME,
 		profile: "a1",
 		fallback: "forbidden",
 	};
@@ -388,21 +469,31 @@ function parseOwner(value: unknown): OwnerRecord {
 
 function parseRisk(value: unknown): RiskRecord {
 	const record = object(value, "risk");
+	if ("cap" in record || "unrealized" in record || "profit" in record) {
+		throw new OlgaRefusal(
+			"Risk state cannot store a permanent ceiling or unrealized profit.",
+		);
+	}
 	rejectExtra(record, [
 		"version",
 		"profile",
-		"cap",
+		"externalCapital",
+		"realizedPnl",
 		"allocated",
 		"reservations",
 	]);
-	if (record.version !== 1 || record.profile !== "a1") {
-		throw new OlgaRefusal("Risk record is not a1 version 1.");
+	if (record.version !== 2 || record.profile !== "a1") {
+		throw new OlgaRefusal("Risk record is not a1 version 2.");
 	}
-	if (record.cap !== RISK_CAP) {
+	if (record.externalCapital !== MAX_EXTERNAL_CAPITAL) {
 		throw new OlgaRefusal(
-			"Risk cap is not the immutable 5.000000 total. Refusing to load it.",
+			"External capital is not the initial 5.000000. Refusing a top-up or a reduced base.",
 		);
 	}
+	if (typeof record.realizedPnl !== "string") {
+		throw new OlgaRefusal("Realized result is not a finite decimal.");
+	}
+	finiteMoney(record.realizedPnl);
 	if (!Array.isArray(record.reservations)) {
 		throw new OlgaRefusal("Risk reservations are missing.");
 	}
@@ -413,13 +504,11 @@ function parseRisk(value: unknown): RiskRecord {
 			"Stored allocated risk does not match the reservations.",
 		);
 	}
-	if (parseMoney(allocated) > parseMoney(RISK_CAP)) {
-		throw new OlgaRefusal("Allocated risk is above the $5 cap.");
-	}
 	return {
-		version: 1,
+		version: 2,
 		profile: "a1",
-		cap: RISK_CAP,
+		externalCapital: MAX_EXTERNAL_CAPITAL,
+		realizedPnl: formatMoney(finiteMoney(record.realizedPnl)),
 		allocated,
 		reservations,
 	};
@@ -427,13 +516,30 @@ function parseRisk(value: unknown): RiskRecord {
 
 function parseReservation(value: unknown): Reservation {
 	const record = object(value, "reservation");
-	rejectExtra(record, ["id", "clientOrderId", "amount", "state"]);
+	rejectExtra(record, [
+		"id",
+		"clientOrderId",
+		"side",
+		"action",
+		"count",
+		"price",
+		"amount",
+		"state",
+	]);
 	if (
 		typeof record.id !== "string" ||
 		typeof record.clientOrderId !== "string" ||
-		typeof record.amount !== "string"
+		typeof record.amount !== "string" ||
+		typeof record.count !== "string" ||
+		typeof record.price !== "string"
 	) {
 		throw new OlgaRefusal("Reservation identity or amount is unreadable.");
+	}
+	if (record.side !== "yes" && record.side !== "no") {
+		throw new OlgaRefusal("Reservation side is unreadable.");
+	}
+	if (record.action !== "buy" && record.action !== "sell") {
+		throw new OlgaRefusal("Reservation action is unreadable.");
 	}
 	if (
 		record.state !== "held" &&
@@ -443,18 +549,23 @@ function parseReservation(value: unknown): Reservation {
 	) {
 		throw new OlgaRefusal("Reservation state is unknown.");
 	}
+	const amount = positiveMoney(record.amount);
 	return {
 		id: record.id,
 		clientOrderId: record.clientOrderId,
-		amount: formatMoney(parseMoney(record.amount)),
+		side: record.side,
+		action: record.action,
+		count: formatCount(parseCount(record.count)),
+		price: formatMoney(positiveMoney(record.price)),
+		amount: formatMoney(amount),
 		state: record.state,
 	};
 }
 
 function parsePolicy(value: unknown): PolicyRecord {
 	const record = object(value, "policy");
-	if ("cap" in record || "allocated" in record) {
-		throw new OlgaRefusal("Policy state cannot carry or change the risk cap.");
+	if ("cap" in record || "allocated" in record || "externalCapital" in record) {
+		throw new OlgaRefusal("Policy state cannot carry or change the bankroll.");
 	}
 	if (
 		record.liveLearning !== false ||
@@ -537,22 +648,50 @@ function parseBinding(value: unknown): BindingRecord {
 function parseClock(value: unknown): ClockRecord {
 	const record = object(value, "clock");
 	if (
-		record.version !== 1 ||
+		record.version !== 2 ||
 		typeof record.lastClockMs !== "number" ||
 		!Number.isFinite(record.lastClockMs) ||
 		typeof record.frozen !== "boolean"
 	) {
 		throw new OlgaRefusal("Clock record is unreadable.");
 	}
+	if (
+		record.lastExchangeMs !== null &&
+		(typeof record.lastExchangeMs !== "number" ||
+			!Number.isFinite(record.lastExchangeMs))
+	) {
+		throw new OlgaRefusal("Exchange clock is not finite.");
+	}
 	if (record.freezeReason !== null && typeof record.freezeReason !== "string") {
 		throw new OlgaRefusal("Clock freeze reason is unreadable.");
 	}
 	return {
-		version: 1,
+		version: 2,
 		lastClockMs: record.lastClockMs,
+		lastExchangeMs: record.lastExchangeMs,
 		frozen: record.frozen,
 		freezeReason: record.freezeReason,
 	};
+}
+
+function positiveMoney(input: string): bigint {
+	const units = finiteMoney(input);
+	if (units <= 0n) {
+		throw new OlgaRefusal(
+			"Amount must be a positive finite decimal. Negative and non-finite values are corrupt.",
+		);
+	}
+	return units;
+}
+
+function finiteMoney(input: string): bigint {
+	try {
+		return parseMoney(input);
+	} catch {
+		throw new OlgaRefusal(
+			"Amount is not a finite decimal. Negative and non-finite values are corrupt.",
+		);
+	}
 }
 
 function nullableString(value: unknown, label: string): string | null {

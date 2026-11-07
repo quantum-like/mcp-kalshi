@@ -1,14 +1,17 @@
+import { spendableUnits } from "./state.js";
 import {
-	A1_KEYCHAIN_SERVICE,
-	OLGA_HOST_ID,
+	OLGA_HOME,
+	OLGA_MACHINE_ID,
 	type OlgaState,
 	POLICY_GATES,
 	SEALED_POLICY_IDS,
 } from "./state.js";
+import { A1_KEYCHAIN_SERVICE } from "./state.js";
 
 export const MAX_FEED_AGE_MS = 15_000;
 export const MAX_AWAKE_GAP_MS = 60_000;
 export const MAX_CLOCK_BACK_MS = 1_000;
+export const MAX_EXCHANGE_SKEW_MS = 5_000;
 
 export interface ObservedIdentity {
 	apiKeyId: string | null;
@@ -32,6 +35,9 @@ export function decideOlga(
 	input: {
 		nowMs: number;
 		feedAtMs: number | null;
+		exchangeNowMs: number | null;
+		observedMachineId: string | null;
+		observedHome: string | null;
 		observed: ObservedIdentity;
 		profile?: string;
 	},
@@ -40,16 +46,23 @@ export function decideOlga(
 		return stop("Refusing to select the a2 profile.");
 	}
 	if (
-		state.owner.hostId !== OLGA_HOST_ID ||
-		state.owner.fallback !== "forbidden" ||
-		state.owner.profile !== "a1"
+		input.observedMachineId !== OLGA_MACHINE_ID ||
+		input.observedHome !== OLGA_HOME ||
+		state.owner.machineId !== OLGA_MACHINE_ID ||
+		state.owner.home !== OLGA_HOME ||
+		state.owner.fallback !== "forbidden"
 	) {
-		return stop("Host ownership does not match Olga. No automatic fallback.");
+		return stop("Machine fence does not match the Olga host. No fallback.");
 	}
 	const identity = checkIdentity(state, input.observed);
 	if (!identity.ok) return stop(identity.reason);
-	const fresh = checkFreshness(state, input.nowMs, input.feedAtMs);
+	const fresh = checkFreshness(state, input);
 	if (!fresh.ok) return stop(fresh.reason, fresh.freeze);
+	if (spendableUnits(state.risk) < 0n) {
+		return stop(
+			"Realized losses and costs exceed spendable bankroll after reservations.",
+		);
+	}
 	if (state.risk.reservations.some((item) => item.state === "unknown")) {
 		return stop(
 			"Unknown order outcome stays reserved. No retry and no new order.",
@@ -150,8 +163,11 @@ function checkIdentity(
 
 function checkFreshness(
 	state: OlgaState,
-	nowMs: number,
-	feedAtMs: number | null,
+	input: {
+		nowMs: number;
+		feedAtMs: number | null;
+		exchangeNowMs: number | null;
+	},
 ): { ok: true } | { ok: false; reason: string; freeze: boolean } {
 	if (state.clock.frozen) {
 		return {
@@ -160,26 +176,49 @@ function checkFreshness(
 			freeze: false,
 		};
 	}
-	if (!Number.isFinite(nowMs)) {
+	if (!Number.isFinite(input.nowMs)) {
 		return { ok: false, reason: "Clock is unknown.", freeze: true };
 	}
-	if (nowMs + MAX_CLOCK_BACK_MS < state.clock.lastClockMs) {
+	if (input.exchangeNowMs === null || !Number.isFinite(input.exchangeNowMs)) {
+		return {
+			ok: false,
+			reason: "Exchange clock is missing. Fail closed.",
+			freeze: true,
+		};
+	}
+	const skew = input.nowMs - input.exchangeNowMs;
+	if (skew < 0) {
+		if (-skew > MAX_EXCHANGE_SKEW_MS) {
+			return {
+				ok: false,
+				reason: "Exchange clock skew. Fail closed.",
+				freeze: true,
+			};
+		}
+	} else if (skew > MAX_EXCHANGE_SKEW_MS) {
+		return {
+			ok: false,
+			reason: "Exchange clock skew. Fail closed.",
+			freeze: true,
+		};
+	}
+	if (input.nowMs + MAX_CLOCK_BACK_MS < state.clock.lastClockMs) {
 		return { ok: false, reason: "Clock moved backwards.", freeze: true };
 	}
-	if (nowMs - state.clock.lastClockMs > MAX_AWAKE_GAP_MS) {
+	if (input.nowMs - state.clock.lastClockMs > MAX_AWAKE_GAP_MS) {
 		return {
 			ok: false,
 			reason: "Sleep or stale clock gap. No catch-up.",
 			freeze: true,
 		};
 	}
-	if (feedAtMs === null || !Number.isFinite(feedAtMs)) {
+	if (input.feedAtMs === null || !Number.isFinite(input.feedAtMs)) {
 		return { ok: false, reason: "Market feed is missing.", freeze: true };
 	}
-	if (nowMs - feedAtMs > MAX_FEED_AGE_MS) {
+	if (input.nowMs - input.feedAtMs > MAX_FEED_AGE_MS) {
 		return { ok: false, reason: "Market feed is stale.", freeze: true };
 	}
-	if (feedAtMs > nowMs + MAX_CLOCK_BACK_MS) {
+	if (input.feedAtMs > input.nowMs + MAX_CLOCK_BACK_MS) {
 		return {
 			ok: false,
 			reason: "Feed timestamp is ahead of the clock.",

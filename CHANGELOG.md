@@ -1,5 +1,20 @@
 # @iqai/mcp-kalshi
 
+## 0.1.7
+
+### Patch Changes
+
+- Correct the disabled Olga bankroll. External capital stays 5.000000.
+  Realized profits can be reserved again. Losses and costs deduct. Unrealized
+  profit and external top-ups are refused. Reservations include fees, and a
+  saved negative or non-finite amount is rejected.
+- Lock the host with Node's built-in SQLite exclusive lock, which the kernel
+  releases on crash on Linux and macOS. Bind the owner to the confirmed Olga
+  machine id. A text label is not accepted.
+- Persist the clock after a successful WAIT. A missing or skewed exchange
+  clock, or a stale feed, stops the tick. Orders stay disabled. No policy is
+  sealed. a2 is unchanged.
+
 ## 0.1.6
 
 ### Patch Changes

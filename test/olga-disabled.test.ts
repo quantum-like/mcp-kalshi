@@ -14,21 +14,27 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
+import { formatMoney } from "../src/lib/fixed.js";
 import { MAX_AWAKE_GAP_MS, decideOlga } from "../src/olga/decide.js";
 import { acquireHostLock } from "../src/olga/lock.js";
 import {
-	OLGA_HOST_ID,
-	RISK_CAP,
+	MAX_EXTERNAL_CAPITAL,
+	OLGA_HOME,
+	OLGA_MACHINE_ID,
 	SEALED_POLICY_IDS,
+	bookRealized,
+	feeInclusiveHold,
 	initializeDisabledCandidate,
 	loadOlgaState,
 	markSubmitting,
 	markUnknown,
-	rejectProfitOrTopUp,
+	rejectExternalTopUp,
+	rejectUnrealizedSpend,
 	releaseUnsent,
 	reserve,
 	saveBinding,
 	saveRisk,
+	spendableUnits,
 } from "../src/olga/state.js";
 import { OLGA_DISABLED, runDisabledTick } from "../src/olga/tick.js";
 
@@ -49,6 +55,37 @@ async function freshDir(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "olga-a1-"));
 }
 
+function order(
+	id: string,
+	action: "buy" | "sell" = "buy",
+	side: "yes" | "no" = "yes",
+	count = "1.00",
+	price = "0.500000",
+) {
+	return {
+		clientOrderId: id,
+		action,
+		side,
+		count,
+		price,
+		feeType: "quadratic" as const,
+		feeMultiplier: "1.000000",
+		balancePrecision: "0.01" as const,
+	};
+}
+
+function tick(directory: string, nowMs = NOW + 1_000) {
+	return {
+		directory,
+		nowMs,
+		feedAtMs: nowMs,
+		exchangeNowMs: nowMs,
+		observedMachineId: OLGA_MACHINE_ID,
+		observedHome: OLGA_HOME,
+		observed: observedBound(),
+	};
+}
+
 async function ready(directory: string) {
 	await initializeDisabledCandidate(directory, NOW);
 	const loaded = await loadOlgaState(directory);
@@ -64,33 +101,46 @@ async function ready(directory: string) {
 	});
 }
 
-test("the $5 total cap rejects another cent, profit, and a rewritten cap", async () => {
+test("external capital stays 5 while realized profit is reusable and losses deduct", async () => {
 	const directory = await freshDir();
 	try {
 		await initializeDisabledCandidate(directory, NOW);
 		let loaded = await loadOlgaState(directory);
 		assert.equal(loaded.ok, true);
 		if (!loaded.ok) return;
-		const reserved = reserve(loaded.state.risk, "5.000000", "cap-1");
-		await saveRisk(directory, reserved);
+		const first = reserve(
+			loaded.state.risk,
+			order("buy-10", "buy", "yes", "10.00", "0.400000"),
+		);
+		assert.equal(first.reservations[0]?.amount, "4.363000");
+		assert.notEqual(first.reservations[0]?.amount, "4.000000");
+		const second = reserve(first, order("extra-a"));
+		assert.throws(() => reserve(second, order("extra-b")), /exceeds spendable/);
+		const withProfit = bookRealized(second, "1.000000");
+		assert.equal(withProfit.realizedPnl, "1.000000");
+		const afterProfit = reserve(withProfit, order("extra-b"));
+		assert.equal(afterProfit.reservations.length, 3);
+		const withLoss = bookRealized(afterProfit, "-0.250000");
+		assert.equal(withLoss.realizedPnl, "0.750000");
+		assert.ok(spendableUnits(withLoss) < spendableUnits(afterProfit));
+		await saveRisk(directory, withLoss);
 		loaded = await loadOlgaState(directory);
 		assert.equal(loaded.ok, true);
 		if (!loaded.ok) return;
-		assert.equal(loaded.state.risk.cap, RISK_CAP);
-		assert.equal(loaded.state.risk.allocated, "5.000000");
+		assert.equal(loaded.state.risk.externalCapital, MAX_EXTERNAL_CAPITAL);
+		assert.throws(() => rejectExternalTopUp(), /cannot be topped up/);
 		assert.throws(
-			() => reserve(loaded.state.risk, "0.000001", "cap-2"),
-			/immutable \$5/,
+			() => rejectUnrealizedSpend(),
+			/Unrealized profit is not spendable/,
 		);
-		assert.throws(() => rejectProfitOrTopUp(), /cannot raise or reset/);
 		const raw = JSON.parse(
 			await readFile(join(directory, "olga-risk.json"), "utf8"),
-		) as { cap: string; profit?: string };
-		raw.cap = "6.000000";
+		) as { externalCapital: string; unrealized?: string };
+		raw.externalCapital = "6.000000";
 		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(raw));
 		const tampered = await loadOlgaState(directory);
 		assert.equal(tampered.ok, false);
-		assert.match(tampered.ok ? "" : tampered.reason, /immutable 5\.000000/);
+		assert.match(tampered.ok ? "" : tampered.reason, /initial 5\.000000/);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -100,15 +150,15 @@ test("a1 account binding rejects a2, a different member, and an incomplete read"
 	const directory = await freshDir();
 	try {
 		await ready(directory);
-		const base = {
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		};
+		const base = tick(directory);
 		const a2 = await runDisabledTick({ ...base, profile: "a2" });
 		assert.equal(a2.action, "STOP");
 		assert.match(a2.reasons[0] ?? "", /a2 profile/);
+		const otherMachine = await runDisabledTick({
+			...base,
+			observedMachineId: "00000000-0000-0000-0000-000000000000",
+		});
+		assert.match(otherMachine.reasons[0] ?? "", /Machine fence/);
 		const otherMember = await runDisabledTick({
 			...base,
 			observed: { ...observedBound(), memberId: "member-a2" },
@@ -150,16 +200,14 @@ test("reservations survive a new process load and are not reset", async () => {
 		const first = await loadOlgaState(directory);
 		assert.equal(first.ok, true);
 		if (!first.ok) return;
-		await saveRisk(
-			directory,
-			reserve(first.state.risk, "1.250000", "durable-1"),
-		);
+		await saveRisk(directory, reserve(first.state.risk, order("durable-1")));
 		const second = await loadOlgaState(directory);
 		assert.equal(second.ok, true);
 		if (!second.ok) return;
-		assert.equal(second.state.risk.allocated, "1.250000");
+		assert.equal(second.state.risk.allocated, "0.555000");
 		assert.equal(second.state.risk.reservations[0]?.state, "held");
-		assert.equal(second.state.risk.cap, "5.000000");
+		assert.equal(second.state.risk.externalCapital, "5.000000");
+		assert.equal(second.state.risk.realizedPnl, "0.000000");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -172,14 +220,9 @@ test("an unknown order outcome is not retried or released", async () => {
 		const loaded = await loadOlgaState(directory);
 		assert.equal(loaded.ok, true);
 		if (!loaded.ok) return;
-		const held = reserve(loaded.state.risk, "0.500000", "unknown-1");
+		const held = reserve(loaded.state.risk, order("unknown-1"));
 		await saveRisk(directory, markUnknown(held, "unknown-1"));
-		const input = {
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		};
+		const input = tick(directory);
 		const first = await runDisabledTick(input);
 		const second = await runDisabledTick(input);
 		assert.equal(first.action, "STOP");
@@ -192,7 +235,7 @@ test("an unknown order outcome is not retried or released", async () => {
 		if (!after.ok) return;
 		assert.equal(after.state.risk.reservations[0]?.state, "unknown");
 		assert.throws(
-			() => reserve(after.state.risk, "0.100000", "unknown-2"),
+			() => reserve(after.state.risk, order("unknown-2")),
 			/not retried|unknown order/i,
 		);
 		assert.throws(
@@ -211,14 +254,9 @@ test("an orphan submitting order stops and is not released by the tick", async (
 		const loaded = await loadOlgaState(directory);
 		assert.equal(loaded.ok, true);
 		if (!loaded.ok) return;
-		const held = reserve(loaded.state.risk, "0.400000", "orphan-1");
+		const held = reserve(loaded.state.risk, order("orphan-1"));
 		await saveRisk(directory, markSubmitting(held, "orphan-1"));
-		const decision = await runDisabledTick({
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		});
+		const decision = await runDisabledTick(tick(directory));
 		assert.equal(decision.action, "STOP");
 		assert.match(decision.reasons[0] ?? "", /Orphan submitting/);
 		assert.equal(decision.submits, 0);
@@ -281,22 +319,18 @@ test("a killed holder releases the kernel lock and a foreign host is not adopted
 			join(directory, "olga-owner.json"),
 			JSON.stringify({
 				version: 1,
-				hostId: "other-mac",
+				hostId: "olga",
 				profile: "a1",
 				fallback: "auto",
 			}),
 		);
-		const decision = await runDisabledTick({
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		});
+		const decision = await runDisabledTick(tick(directory));
 		assert.equal(decision.action, "STOP");
-		assert.match(decision.reasons[0] ?? "", /No automatic fallback/);
+		assert.match(decision.reasons[0] ?? "", /text host label/);
 		const owner = await readFile(join(directory, "olga-owner.json"), "utf8");
-		assert.match(owner, /other-mac/);
-		assert.equal(OLGA_HOST_ID, "olga");
+		assert.match(owner, /"hostId":"olga"/);
+		assert.equal(OLGA_MACHINE_ID, "f79c77c4-4b66-4a92-9669-f49bf82f9e59");
+		assert.equal(OLGA_HOME, "/Users/olgavlasova");
 	} finally {
 		if (holder.exitCode === null) holder.kill("SIGKILL");
 		await rm(directory, { recursive: true, force: true });
@@ -309,9 +343,7 @@ test("a missing or unknown a1 key stops the tick", async () => {
 		await ready(directory);
 		for (const keyPresent of [false, null]) {
 			const decision = await runDisabledTick({
-				directory,
-				nowMs: NOW + 1_000,
-				feedAtMs: NOW + 1_000,
+				...tick(directory),
 				observed: { ...observedBound(), keyPresent },
 			});
 			assert.equal(decision.action, "STOP");
@@ -372,12 +404,7 @@ test("unknown and unvalidated policy waits and live learning is refused", async 
 	const directory = await freshDir();
 	try {
 		await ready(directory);
-		const input = {
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		};
+		const input = tick(directory);
 		const waiting = await runDisabledTick(input);
 		assert.equal(waiting.action, "WAIT");
 		assert.match(waiting.reasons[0] ?? "", /not a profitability claim/);
@@ -440,41 +467,140 @@ test("sleep, a stale feed, and a missing file fail closed with no fallback", asy
 	try {
 		await ready(staleDirectory);
 		const stale = await runDisabledTick({
-			directory: staleDirectory,
-			nowMs: NOW + 1_000,
+			...tick(staleDirectory),
 			feedAtMs: NOW - 20_000,
-			observed: observedBound(),
 		});
 		assert.equal(stale.action, "STOP");
 		assert.match(stale.reasons[0] ?? "", /Market feed is stale/);
 		await ready(directory);
 		const slept = await runDisabledTick({
-			directory,
-			nowMs: NOW + MAX_AWAKE_GAP_MS + 1,
-			feedAtMs: NOW + MAX_AWAKE_GAP_MS + 1,
-			observed: observedBound(),
+			...tick(directory, NOW + MAX_AWAKE_GAP_MS + 1),
 		});
 		assert.equal(slept.action, "STOP");
 		assert.match(slept.reasons[0] ?? "", /No catch-up/);
-		const later = await runDisabledTick({
-			directory,
-			nowMs: NOW + MAX_AWAKE_GAP_MS + 2_000,
-			feedAtMs: NOW + MAX_AWAKE_GAP_MS + 2_000,
-			observed: observedBound(),
-		});
+		const later = await runDisabledTick(
+			tick(directory, NOW + MAX_AWAKE_GAP_MS + 2_000),
+		);
 		assert.match(later.reasons[0] ?? "", /No catch-up/);
 		await unlink(join(directory, "olga-risk.json"));
-		const partial = await runDisabledTick({
-			directory,
-			nowMs: NOW + 1_000,
-			feedAtMs: NOW + 1_000,
-			observed: observedBound(),
-		});
+		const partial = await runDisabledTick(tick(directory));
 		assert.match(partial.reasons[0] ?? "", /replenish/);
 		const names = await readdir(directory);
 		assert.equal(names.includes("olga-risk.json"), false);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 		await rm(staleDirectory, { recursive: true, force: true });
+	}
+});
+
+test("a negative or non-finite saved reservation cannot offset the bankroll", async () => {
+	const directory = await freshDir();
+	try {
+		await initializeDisabledCandidate(directory, NOW);
+		const loaded = await loadOlgaState(directory);
+		assert.equal(loaded.ok, true);
+		if (!loaded.ok) return;
+		const raw = JSON.parse(
+			await readFile(join(directory, "olga-risk.json"), "utf8"),
+		) as {
+			allocated: string;
+			reservations: Array<Record<string, string>>;
+		};
+		raw.reservations = [
+			{
+				id: "neg",
+				clientOrderId: "neg",
+				side: "yes",
+				action: "buy",
+				count: "1.00",
+				price: "0.500000",
+				amount: "-1.000000",
+				state: "held",
+			},
+			{
+				id: "six",
+				clientOrderId: "six",
+				side: "no",
+				action: "buy",
+				count: "1.00",
+				price: "0.500000",
+				amount: "6.000000",
+				state: "held",
+			},
+		];
+		raw.allocated = "5.000000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(raw));
+		const negative = await loadOlgaState(directory);
+		assert.equal(negative.ok, false);
+		assert.match(negative.ok ? "" : negative.reason, /positive finite/);
+		raw.reservations[0].amount = "NaN";
+		raw.allocated = "6.000000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(raw));
+		const nonFinite = await loadOlgaState(directory);
+		assert.equal(nonFinite.ok, false);
+		assert.match(nonFinite.ok ? "" : nonFinite.reason, /finite/);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("YES and NO entries and a sell can be reserved without a side cap", async () => {
+	const directory = await freshDir();
+	try {
+		await initializeDisabledCandidate(directory, NOW);
+		const loaded = await loadOlgaState(directory);
+		assert.equal(loaded.ok, true);
+		if (!loaded.ok) return;
+		const yes = reserve(loaded.state.risk, order("yes-buy", "buy", "yes"));
+		const no = reserve(yes, order("no-buy", "buy", "no"));
+		const sold = reserve(no, order("yes-sell", "sell", "yes"));
+		assert.equal(feeInclusiveHold(order("yes-buy")), "0.555000");
+		assert.equal(sold.reservations[2]?.amount, "0.027500");
+		assert.deepEqual(
+			sold.reservations.map((item) => `${item.side}:${item.action}`),
+			["yes:buy", "no:buy", "yes:sell"],
+		);
+		assert.throws(
+			() => reserve(sold, order("yes-buy")),
+			/duplicate in-flight id/,
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a successful tick stores the clock and exchange skew fails closed", async () => {
+	const directory = await freshDir();
+	try {
+		await ready(directory);
+		const first = await runDisabledTick(tick(directory, NOW + 50_000));
+		assert.equal(first.action, "WAIT");
+		const second = await runDisabledTick(tick(directory, NOW + 80_000));
+		assert.equal(second.action, "WAIT");
+		const clock = JSON.parse(
+			await readFile(join(directory, "olga-clock.json"), "utf8"),
+		) as { lastClockMs: number; lastExchangeMs: number };
+		assert.equal(clock.lastClockMs, NOW + 80_000);
+		assert.equal(clock.lastExchangeMs, NOW + 80_000);
+		const missingDir = await freshDir();
+		await ready(missingDir);
+		const missing = await runDisabledTick({
+			...tick(missingDir),
+			exchangeNowMs: null,
+		});
+		assert.equal(missing.action, "STOP");
+		assert.match(missing.reasons[0] ?? "", /Exchange clock is missing/);
+		const skewDir = await freshDir();
+		await ready(skewDir);
+		const skewed = await runDisabledTick({
+			...tick(skewDir),
+			exchangeNowMs: NOW + 1_000 + 10_000,
+		});
+		assert.equal(skewed.action, "STOP");
+		assert.match(skewed.reasons[0] ?? "", /Exchange clock skew/);
+		await rm(missingDir, { recursive: true, force: true });
+		await rm(skewDir, { recursive: true, force: true });
+	} finally {
+		await rm(directory, { recursive: true, force: true });
 	}
 });

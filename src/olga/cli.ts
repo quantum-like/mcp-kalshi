@@ -23,6 +23,9 @@ export async function main(argv: string[]): Promise<number> {
 		directory: resolve(directory),
 		nowMs: Date.now(),
 		feedAtMs: null,
+		exchangeNowMs: null,
+		observedMachineId: null,
+		observedHome: null,
 		observed: {
 			apiKeyId: null,
 			memberId: null,

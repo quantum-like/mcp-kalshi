@@ -10,6 +10,9 @@ export async function runDisabledTick(input: {
 	directory: string;
 	nowMs: number;
 	feedAtMs: number | null;
+	exchangeNowMs: number | null;
+	observedMachineId: string | null;
+	observedHome: string | null;
 	observed: ObservedIdentity;
 	profile?: string;
 }): Promise<OlgaDecision> {
@@ -32,7 +35,7 @@ export async function runDisabledTick(input: {
 			freezeClock: false,
 		};
 	}
-	const lock = await acquireHostLock(join(input.directory, "olga-host.lock"));
+	const lock = await acquireHostLock(join(input.directory, "olga-host.sqlite"));
 	try {
 		const again = await loadOlgaState(input.directory);
 		if (!again.ok) {
@@ -45,7 +48,15 @@ export async function runDisabledTick(input: {
 			};
 		}
 		const decision = decideOlga(again.state, input);
-		if (decision.freezeClock) {
+		if (decision.action === "WAIT" && input.exchangeNowMs !== null) {
+			await saveClock(input.directory, {
+				version: 2,
+				lastClockMs: input.nowMs,
+				lastExchangeMs: input.exchangeNowMs,
+				frozen: false,
+				freezeReason: null,
+			});
+		} else if (decision.freezeClock) {
 			await saveClock(input.directory, {
 				...again.state.clock,
 				frozen: true,
