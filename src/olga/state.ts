@@ -16,6 +16,7 @@ import {
 } from "../strategy/fees.js";
 import {
 	applyFillToReservations,
+	assertFillLedger,
 	auditReservations,
 	cashDeltaForFill,
 	createReservation,
@@ -563,16 +564,8 @@ function parseRisk(value: unknown): RiskRecord {
 		throw new OlgaRefusal("Applied fills are missing.");
 	}
 	const appliedFills = record.appliedFills.map(parseAppliedFill);
-	const realizedFromFills = appliedFills.reduce(
-		(sum, fill) => sum + finiteMoney(fill.cashDelta),
-		0n,
-	);
 	const realized = formatMoney(finiteMoney(record.realizedPnl));
-	if (realized !== formatMoney(realizedFromFills)) {
-		throw new OlgaRefusal(
-			"Realized profit is not the sum of identified fills. Unrealized profit is not spendable.",
-		);
-	}
+	assertFillLedger(reservations, appliedFills, realized);
 	return {
 		version: 3,
 		profile: "a1",

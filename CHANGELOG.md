@@ -1,5 +1,15 @@
 # @iqai/mcp-kalshi
 
+## 0.1.9
+
+### Patch Changes
+
+- Replay saved fills against reservations. Duplicate fill ids, fills with
+  no position, naked sells, and buy prices outside (0, 1) or above the
+  reserved limit are rejected. A release cannot hide an open buy. Released
+  history must stay finite. Partial sells keep the exit-fee hold consistent.
+  External capital stays 5.000000. Orders stay disabled.
+
 ## 0.1.8
 
 ### Patch Changes
