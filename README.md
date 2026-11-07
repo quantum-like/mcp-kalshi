@@ -173,7 +173,7 @@ The offline bundle ships compiled tests. From the extracted directory, with no i
 node offline-accept.mjs
 ```
 
-That command exits nonzero if it discovers zero tests or a count other than the number in `EXPECTED_TESTS`. It does not call Kalshi.
+That command requests the TAP reporter and also accepts the Node spec summary (`ℹ tests N`). It exits nonzero if it discovers zero tests, a count other than `EXPECTED_TESTS`, or any failing test. It does not call Kalshi.
 
 ## A1 readiness (disarmed)
 

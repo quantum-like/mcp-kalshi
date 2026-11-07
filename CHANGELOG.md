@@ -1,5 +1,14 @@
 # @iqai/mcp-kalshi
 
+## 0.1.5
+
+### Patch Changes
+
+- Make `node offline-accept.mjs` count both TAP (`# tests N`) and the Node
+  spec reporter (`ℹ tests N`). Node 24's default spec summary was parsed as
+  zero tests. The command still exits nonzero for zero tests, the wrong count,
+  or a failing test. The a1 and a2 profiles are unchanged.
+
 ## 0.1.4
 
 ### Patch Changes
