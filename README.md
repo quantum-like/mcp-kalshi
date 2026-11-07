@@ -14,7 +14,7 @@ By implementing the Model Context Protocol (MCP), this server allows Large Langu
 *   **Market Discovery**: Search and filter prediction markets by status, series, or event keywords.
 *   **Real-time Pricing**: Access live price data, implied probabilities, and depth-of-market (order books) for any market.
 *   **Portfolio Tracking**: Monitor account balance, positions, trade history, fills, and settlements.
-*   **Trading Operations**: Place limit or market orders, cancel orders, and manage positions.
+*   **Trading Operations**: Place one limit order at a time. YES/NO prices in whole cents are mapped onto the YES book. Cancel and decrease require the market ticker. Market orders are rejected. Amend and batch-create stay fail-closed.
 
 ## 📦 Installation
 
@@ -29,7 +29,7 @@ npx @iqai/mcp-kalshi
 ### 🔧 Build from Source
 
 ```bash
-git clone https://github.com/IQAIcom/mcp-kalshi.git
+git clone https://github.com/quantum-like/mcp-kalshi.git
 cd mcp-kalshi
 pnpm install
 pnpm run build
@@ -111,7 +111,7 @@ Add the following configuration to your MCP client settings (e.g., `claude_deskt
 
 ### 📝 Trading
 *   "Place a limit buy order for 10 Yes contracts at 45 cents on [market]"
-*   "Cancel my order with ID [order_id]"
+*   "Cancel order [order_id] on market [ticker]"
 *   "Show me all my resting orders"
 
 ## 🛠️ MCP Tools
@@ -152,11 +152,43 @@ pnpm run build
 pnpm run watch
 ```
 
-### ✅ Linting & Formatting
+### ✅ Linting, tests, and build
 ```bash
 pnpm run lint
-pnpm run format
+pnpm test
+pnpm run build
 ```
+
+`pnpm test` uses a mocked Axios transport. It does not call Kalshi and it does not prove the exchange accepted an order.
+
+## Deploying this fork
+
+This package is the `quantum-like/mcp-kalshi` fork. Do not publish it to npm and do not point a launcher at `@iqai/mcp-kalshi@0.1.1`.
+
+Build from this commit with the lockfile:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm test
+pnpm run build
+```
+
+Point the existing stdio MCP configuration at the built server and keep the same credential environment variables:
+
+```json
+{
+  "command": "node",
+  "args": ["/absolute/path/to/mcp-kalshi/dist/index.js"],
+  "env": {
+    "KALSHI_API_KEY": "your_api_key_here",
+    "KALSHI_PRIVATE_KEY_PATH": "/absolute/path/to/private-key.pem"
+  }
+}
+```
+
+The base URL stays `https://api.elections.kalshi.com/trade-api/v2`. Swapping this command is an operator step. This repository does not restart a running connector, place an order, or change any schedule.
+
+Rollback: point the same MCP configuration back at the previous build, or check out commit `15c12b37ed9f1b0e3fc0000e4918e9191c2b282b` and rebuild. Leave any external monitor-only hold in place until that hold is cleared by its own procedure.
 
 ### 📁 Project Structure
 *   `src/tools/`: Individual tool definitions

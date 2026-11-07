@@ -43,18 +43,24 @@ export interface GetTradesParams {
 export { GetMarketCandlesticksPeriodIntervalEnum };
 
 export class MarketsService {
-	private get client(): KalshiClient {
-		return KalshiClient.getInstance();
+	constructor(private readonly marketApi?: KalshiClient["market"]) {}
+
+	private get market(): KalshiClient["market"] {
+		return this.marketApi ?? KalshiClient.getInstance().market;
 	}
 
 	async getMarkets(params: GetMarketsParams = {}) {
-		const response = await this.client.market.getMarkets(
+		// SDK 3.35 inserted minUpdatedTs and maxUpdatedTs before the close filters.
+		// Passing undefined keeps maxCloseTs on max_close_ts instead of min_updated_ts.
+		const response = await this.market.getMarkets(
 			params.limit,
 			params.cursor,
 			params.eventTicker,
 			params.seriesTicker,
 			params.minCreatedTs,
 			params.maxCreatedTs,
+			undefined,
+			undefined,
 			params.maxCloseTs,
 			params.minCloseTs,
 			params.minSettledTs,
@@ -66,12 +72,12 @@ export class MarketsService {
 	}
 
 	async getMarket(ticker: string) {
-		const response = await this.client.market.getMarket(ticker);
+		const response = await this.market.getMarket(ticker);
 		return response.data;
 	}
 
 	async getMarketOrderbook(params: GetMarketOrderbookParams) {
-		const response = await this.client.market.getMarketOrderbook(
+		const response = await this.market.getMarketOrderbook(
 			params.ticker,
 			params.depth,
 		);
@@ -79,7 +85,7 @@ export class MarketsService {
 	}
 
 	async getMarketCandlesticks(params: GetMarketCandlesticksParams) {
-		const response = await this.client.market.getMarketCandlesticks(
+		const response = await this.market.getMarketCandlesticks(
 			params.seriesTicker,
 			params.marketTicker,
 			params.startTs,
@@ -90,7 +96,7 @@ export class MarketsService {
 	}
 
 	async getTrades(params: GetTradesParams = {}) {
-		const response = await this.client.market.getTrades(
+		const response = await this.market.getTrades(
 			params.limit,
 			params.cursor,
 			params.ticker,
@@ -101,12 +107,12 @@ export class MarketsService {
 	}
 
 	async getSeries(seriesTicker: string) {
-		const response = await this.client.market.getSeries(seriesTicker);
+		const response = await this.market.getSeries(seriesTicker);
 		return response.data;
 	}
 
 	async getSeriesList(category?: string, tags?: string) {
-		const response = await this.client.market.getSeriesList(category, tags);
+		const response = await this.market.getSeriesList(category, tags);
 		return response.data;
 	}
 }

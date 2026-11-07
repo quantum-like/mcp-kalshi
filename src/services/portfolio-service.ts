@@ -27,20 +27,25 @@ export interface GetSettlementsParams {
 }
 
 export class PortfolioService {
-	private get client(): KalshiClient {
-		return KalshiClient.getInstance();
+	constructor(private readonly portfolioApi?: KalshiClient["portfolio"]) {}
+
+	private get portfolio(): KalshiClient["portfolio"] {
+		return this.portfolioApi ?? KalshiClient.getInstance().portfolio;
 	}
 
 	async getBalance() {
-		const response = await this.client.portfolio.getBalance();
+		const response = await this.portfolio.getBalance();
 		return response.data;
 	}
 
 	async getPositions(params: GetPositionsParams = {}) {
-		const response = await this.client.portfolio.getPositions(
+		// SDK 3.35 inserted settlementStatus before ticker. Leaving it undefined
+		// preserves the ticker filter instead of sending the ticker as a status.
+		const response = await this.portfolio.getPositions(
 			params.cursor,
 			params.limit,
 			params.countFilter,
+			undefined,
 			params.ticker,
 			params.eventTicker,
 		);
@@ -48,7 +53,7 @@ export class PortfolioService {
 	}
 
 	async getFills(params: GetFillsParams = {}) {
-		const response = await this.client.portfolio.getFills(
+		const response = await this.portfolio.getFills(
 			params.ticker,
 			params.orderId,
 			params.minTs,
@@ -60,7 +65,7 @@ export class PortfolioService {
 	}
 
 	async getSettlements(params: GetSettlementsParams = {}) {
-		const response = await this.client.portfolio.getSettlements(
+		const response = await this.portfolio.getSettlements(
 			params.limit,
 			params.cursor,
 			params.ticker,
@@ -72,8 +77,7 @@ export class PortfolioService {
 	}
 
 	async getRestingOrderTotalValue() {
-		const response =
-			await this.client.portfolio.getPortfolioRestingOrderTotalValue();
+		const response = await this.portfolio.getPortfolioRestingOrderTotalValue();
 		return response.data;
 	}
 }

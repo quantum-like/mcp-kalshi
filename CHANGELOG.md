@@ -1,5 +1,16 @@
 # @iqai/mcp-kalshi
 
+## 0.1.2
+
+### Patch Changes
+
+- Pin kalshi-typescript to 3.35.0 and map order writes to the V2 event-order API.
+  CREATE_ORDER translates YES/NO buy/sell cents onto the YES book, sends fixed-point
+  counts and dollar prices, and does not retry. Cancel and decrease require a market
+  ticker and use the V2 acknowledgement shape. Amend and batch create stay fail-closed.
+  Read tools follow the SDK 3.35 fixed-point fields and the shifted getMarkets and
+  getPositions argument lists. This fork is not published to npm.
+
 ## 0.1.1
 
 ### Patch Changes
