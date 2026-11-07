@@ -161,6 +161,17 @@ pnpm run build
 
 `pnpm test` uses a mocked Axios transport. It does not call Kalshi and it does not prove the exchange accepted an order.
 
+## A1 readiness (disarmed)
+
+Version 0.1.3 adds read and accounting tools without changing the 0.1.2 order acknowledgement, cancel routing, or whole-cent create path.
+
+- `READ_BALANCE`, `READ_POSITIONS`, `READ_ORDERS`, `READ_FILLS`, and `READ_SETTLEMENTS` report fixed-point strings, full ids, cursors, and completeness. A missing number is `UNKNOWN`. A failed page is not an empty account.
+- `CREATE_ORDER` accepts an optional `clientOrderId`. Omitting it still generates one id for that call and does not retry. Optional dollar prices require `priceRanges` observed at `priceObservedAt`. Legacy cent fields stay whole cents and are not reinterpreted as dollars.
+- `A1_STRATEGY_STATUS` reports a disarmed $5 ledger. The server does not arm it and does not route `CREATE_ORDER` through it. The ledger cannot stop another API key, the a2 connector, or a manual order from spending the same Kalshi account. `SENATEAK` is refused inside the strategy API only.
+- Sealed-date screening defaults to mode `000` and an empty historical day list. It is not a collector and it does not read market-data files.
+
+Remaining gates before any reconnect: confirm the installed binary hash, compare live positions and pages read-only, keep writes disabled on mismatch, and do not clear an external monitor-only hold. Flat fee series and incomplete account reads halt the strategy. The legacy cent path is not checked against the market tick grid.
+
 ## Deploying this fork
 
 This package is the `quantum-like/mcp-kalshi` fork. It is not published to npm. The parent host installs the self-contained offline bundle, which already contains `dist/` and the production `node_modules` resolved from `pnpm-lock.yaml`.

@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { CreateOrderV2Response, OrdersApi } from "kalshi-typescript";
 import {
+	type GridLimitInput,
+	toGridCreateOrder,
+	usesDollarPrices,
+} from "../orders/price-grid.js";
+import {
 	type LegacyCreateInput,
 	toCreateOrderV2,
 } from "./create-order-v2-adapter.js";
@@ -16,7 +21,17 @@ export interface GetOrdersParams {
 	cursor?: string;
 }
 
-export interface CreateOrderParams extends LegacyCreateInput {}
+export interface CreateOrderParams
+	extends LegacyCreateInput,
+		Pick<
+			GridLimitInput,
+			| "yesPriceDollars"
+			| "noPriceDollars"
+			| "priceRanges"
+			| "priceObservedAt"
+			| "now"
+			| "maxMetadataAgeMs"
+		> {}
 
 export interface AmendOrderParams {
 	orderId: string;
@@ -129,7 +144,9 @@ export class OrdersService {
 	}
 
 	async createOrder(params: CreateOrderParams): Promise<CreateOrderV2Response> {
-		const validated = toCreateOrderV2(params);
+		const validated = usesDollarPrices(params)
+			? toGridCreateOrder(params)
+			: toCreateOrderV2(params);
 		const clientOrderId = params.clientOrderId ?? this.createClientOrderId();
 		const request = { ...validated, client_order_id: clientOrderId };
 		// Exactly one SDK call. An unknown outcome is not retried.

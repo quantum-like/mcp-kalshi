@@ -1,5 +1,16 @@
 # @iqai/mcp-kalshi
 
+## 0.1.3
+
+### Patch Changes
+
+- Add disarmed a1 reads and strategy accounting beside the 0.1.2 order contract.
+  Structured balance, position, order, fill, and settlement reads report cursors
+  and UNKNOWN for missing fixed-point fields. Optional dollar prices require a
+  fresh price grid. Optional clientOrderId is caller-stable. The $5 ledger
+  stays disarmed, does not submit orders, and does not constrain other account
+  callers or the SENATEAK holding.
+
 ## 0.1.2
 
 ### Patch Changes
