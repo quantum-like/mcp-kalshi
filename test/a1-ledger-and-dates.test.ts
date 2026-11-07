@@ -223,6 +223,60 @@ test("timeout freezes the intent, does not retry, and survives a restart", async
 		const freed = await restarted.status();
 		assert.equal(freed.intents[0]?.state, "released");
 		assert.equal(restarted.freeCash(freed), "5.000000");
+		const bought = await restarted.beginIntent(
+			intent({
+				clientOrderId: "flat-buy",
+				count: "1.00",
+				price: "0.500000",
+			}),
+		);
+		await restarted.applyFill({
+			fillId: "flat-buy-1",
+			clientOrderId: "flat-buy",
+			ticker: bought.intent.ticker,
+			outcomeSide: "yes",
+			count: "0.50",
+			price: "0.500000",
+			fee: "0.010000",
+			action: "buy",
+		});
+		await restarted.applyFill({
+			fillId: "flat-buy-2",
+			clientOrderId: "flat-buy",
+			ticker: bought.intent.ticker,
+			outcomeSide: "yes",
+			count: "0.50",
+			price: "0.500000",
+			fee: "0.010000",
+			action: "buy",
+		});
+		const halved = await restarted.status();
+		assert.equal(halved.cash, "4.480000");
+		assert.equal(halved.intents[1]?.reservedNotional, "0.000000");
+		assert.equal(halved.intents[1]?.reservedEntryFee, "0.000000");
+		assert.equal(halved.intents[1]?.reservedExitFee, "0.027500");
+		assert.equal(restarted.freeCash(halved), "4.452500");
+		await restarted.beginIntent(
+			intent({
+				clientOrderId: "flat-sell",
+				action: "sell",
+				count: "1.00",
+				price: "0.500000",
+			}),
+		);
+		await restarted.applyFill({
+			fillId: "flat-sell-fill",
+			clientOrderId: "flat-sell",
+			ticker: bought.intent.ticker,
+			outcomeSide: "yes",
+			count: "1.00",
+			price: "0.500000",
+			fee: "0.020000",
+			action: "sell",
+		});
+		const flat = await restarted.status();
+		assert.equal(flat.cash, "4.960000");
+		assert.equal(restarted.freeCash(flat), "4.960000");
 		const ack = await executeOnce(
 			restarted,
 			intent({ clientOrderId: "ioc" }),

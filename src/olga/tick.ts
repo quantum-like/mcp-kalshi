@@ -1,6 +1,7 @@
 import { join } from "node:path";
-import { type OlgaDecision, decideOlga } from "./decide.js";
+import { type OlgaDecision, clockAfterDecision, decideOlga } from "./decide.js";
 import type { ObservedIdentity } from "./decide.js";
+import { readHostIdentity } from "./host-identity.js";
 import { acquireHostLock } from "./lock.js";
 import { loadOlgaState, saveClock } from "./state.js";
 
@@ -11,8 +12,6 @@ export async function runDisabledTick(input: {
 	nowMs: number;
 	feedAtMs: number | null;
 	exchangeNowMs: number | null;
-	observedMachineId: string | null;
-	observedHome: string | null;
 	observed: ObservedIdentity;
 	profile?: string;
 }): Promise<OlgaDecision> {
@@ -47,22 +46,33 @@ export async function runDisabledTick(input: {
 				freezeClock: false,
 			};
 		}
-		const decision = decideOlga(again.state, input);
-		if (decision.action === "WAIT" && input.exchangeNowMs !== null) {
-			await saveClock(input.directory, {
-				version: 2,
-				lastClockMs: input.nowMs,
-				lastExchangeMs: input.exchangeNowMs,
-				frozen: false,
-				freezeReason: null,
-			});
-		} else if (decision.freezeClock) {
-			await saveClock(input.directory, {
-				...again.state.clock,
-				frozen: true,
-				freezeReason: decision.reasons[0] ?? "halt",
-			});
+		let host: { machineId: string; home: string };
+		try {
+			host = readHostIdentity();
+		} catch {
+			return {
+				action: "STOP",
+				reasons: ["Host identity is unavailable. No fallback."],
+				submits: 0,
+				retries: 0,
+				freezeClock: false,
+			};
 		}
+		const decision = decideOlga(again.state, {
+			nowMs: input.nowMs,
+			feedAtMs: input.feedAtMs,
+			exchangeNowMs: input.exchangeNowMs,
+			host,
+			observed: input.observed,
+			profile: input.profile,
+		});
+		const nextClock = clockAfterDecision(
+			again.state.clock,
+			decision,
+			input.nowMs,
+			input.exchangeNowMs,
+		);
+		if (nextClock) await saveClock(input.directory, nextClock);
 		return decision;
 	} finally {
 		await lock.release();

@@ -14,6 +14,12 @@ import {
 	quoteBuyReservation,
 	reservationFeeUnits,
 } from "../strategy/fees.js";
+import {
+	applyFillToReservations,
+	auditReservations,
+	cashDeltaForFill,
+	createReservation,
+} from "./positions.js";
 
 /** Maximum money that may be introduced from outside. Realized profit is separate. */
 export const MAX_EXTERNAL_CAPITAL = STRATEGY_CAPITAL;
@@ -49,7 +55,20 @@ export interface Reservation {
 	side: "yes" | "no";
 	action: "buy" | "sell";
 	count: string;
+	filled: string;
+	cancelled: string;
+	exitReleased: string;
 	price: string;
+	feeType: string;
+	feeMultiplier: string;
+	balancePrecision: BalancePrecision;
+	coveredFee: string;
+	originNotional: string;
+	originEntryFee: string;
+	originExitFee: string;
+	reservedNotional: string;
+	reservedEntryFee: string;
+	reservedExitFee: string;
 	amount: string;
 	state: ReservationState;
 }
@@ -74,12 +93,21 @@ export interface OwnerRecord {
 }
 
 export interface RiskRecord {
-	version: 2;
+	version: 3;
 	profile: "a1";
 	externalCapital: typeof MAX_EXTERNAL_CAPITAL;
 	realizedPnl: string;
 	allocated: string;
 	reservations: Reservation[];
+	appliedFills: Array<{
+		fillId: string;
+		clientOrderId: string;
+		action: "buy" | "sell";
+		count: string;
+		price: string;
+		fee: string;
+		cashDelta: string;
+	}>;
 }
 
 export interface PolicyRecord {
@@ -141,7 +169,13 @@ function closedGates(): Record<PolicyGate, false> {
 export function allocatedOf(reservations: Reservation[]): bigint {
 	return reservations.reduce((sum, reservation) => {
 		if (reservation.state === "released") return sum;
-		return sum + positiveMoney(reservation.amount);
+		const units = finiteMoney(reservation.amount);
+		if (units < 0n) {
+			throw new OlgaRefusal(
+				"Amount must be a positive finite decimal. Negative and non-finite values are corrupt.",
+			);
+		}
+		return sum + units;
 	}, 0n);
 }
 
@@ -196,12 +230,13 @@ export async function initializeDisabledCandidate(
 			fallback: "forbidden",
 		},
 		risk: {
-			version: 2,
+			version: 3,
 			profile: "a1",
 			externalCapital: MAX_EXTERNAL_CAPITAL,
 			realizedPnl: formatMoney(0n),
 			allocated: formatMoney(0n),
 			reservations: [],
+			appliedFills: [],
 		},
 		policy: {
 			version: 1,
@@ -321,26 +356,14 @@ export function reserve(risk: RiskRecord, input: ReserveInput): RiskRecord {
 			"Client order id is already reserved. Refusing a duplicate in-flight id.",
 		);
 	}
-	const amount = feeInclusiveHold(input);
-	const units = positiveMoney(amount);
-	if (units > spendableUnits(parsed)) {
+	const reservation = createReservation(input, parsed.reservations);
+	const units = finiteMoney(reservation.amount);
+	if (units < 0n || units > spendableUnits(parsed)) {
 		throw new OlgaRefusal(
 			"Fee-inclusive reservation exceeds spendable bankroll. External capital stays 5.000000.",
 		);
 	}
-	const reservations: Reservation[] = [
-		...parsed.reservations,
-		{
-			id: randomUUID(),
-			clientOrderId: input.clientOrderId,
-			side: input.side,
-			action: input.action,
-			count: formatCount(parseCount(input.count)),
-			price: formatMoney(parseMoney(input.price)),
-			amount: formatMoney(units),
-			state: "held",
-		},
-	];
+	const reservations = [...parsed.reservations, reservation];
 	return parseRisk({
 		...parsed,
 		allocated: formatMoney(allocatedOf(reservations)),
@@ -348,13 +371,43 @@ export function reserve(risk: RiskRecord, input: ReserveInput): RiskRecord {
 	});
 }
 
-export function bookRealized(risk: RiskRecord, delta: string): RiskRecord {
+export function bookRealized(_risk?: RiskRecord, _delta?: string): never {
+	throw new OlgaRefusal(
+		"Realized results come from a fill or settlement id. An arbitrary delta is not spendable.",
+	);
+}
+
+export function applyOlgaFill(
+	risk: RiskRecord,
+	fill: {
+		fillId: string;
+		clientOrderId: string;
+		action: "buy" | "sell";
+		count: string;
+		price: string;
+		fee: string;
+	},
+): RiskRecord {
 	const parsed = parseRisk(risk);
-	const next = finiteMoney(parsed.realizedPnl) + finiteMoney(delta);
-	if (finiteMoney(delta) === 0n) {
-		throw new OlgaRefusal("Realized result must be a non-zero finite decimal.");
+	if (parsed.appliedFills.some((item) => item.fillId === fill.fillId)) {
+		return parsed;
 	}
-	return parseRisk({ ...parsed, realizedPnl: formatMoney(next) });
+	const cashDelta = cashDeltaForFill(fill);
+	const reservations = applyFillToReservations(parsed.reservations, {
+		...fill,
+		cashDelta,
+	});
+	const entry = { ...fill, cashDelta };
+	const realized = formatMoney(
+		finiteMoney(parsed.realizedPnl) + finiteMoney(cashDelta),
+	);
+	return parseRisk({
+		...parsed,
+		realizedPnl: realized,
+		allocated: formatMoney(allocatedOf(reservations)),
+		reservations,
+		appliedFills: [...parsed.appliedFills, entry],
+	});
 }
 
 export function rejectExternalTopUp(): never {
@@ -481,9 +534,10 @@ function parseRisk(value: unknown): RiskRecord {
 		"realizedPnl",
 		"allocated",
 		"reservations",
+		"appliedFills",
 	]);
-	if (record.version !== 2 || record.profile !== "a1") {
-		throw new OlgaRefusal("Risk record is not a1 version 2.");
+	if (record.version !== 3 || record.profile !== "a1") {
+		throw new OlgaRefusal("Risk record is not a1 version 3.");
 	}
 	if (record.externalCapital !== MAX_EXTERNAL_CAPITAL) {
 		throw new OlgaRefusal(
@@ -498,20 +552,66 @@ function parseRisk(value: unknown): RiskRecord {
 		throw new OlgaRefusal("Risk reservations are missing.");
 	}
 	const reservations = record.reservations.map(parseReservation);
+	auditReservations(reservations);
 	const allocated = formatMoney(allocatedOf(reservations));
 	if (record.allocated !== allocated) {
 		throw new OlgaRefusal(
 			"Stored allocated risk does not match the reservations.",
 		);
 	}
+	if (!Array.isArray(record.appliedFills)) {
+		throw new OlgaRefusal("Applied fills are missing.");
+	}
+	const appliedFills = record.appliedFills.map(parseAppliedFill);
+	const realizedFromFills = appliedFills.reduce(
+		(sum, fill) => sum + finiteMoney(fill.cashDelta),
+		0n,
+	);
+	const realized = formatMoney(finiteMoney(record.realizedPnl));
+	if (realized !== formatMoney(realizedFromFills)) {
+		throw new OlgaRefusal(
+			"Realized profit is not the sum of identified fills. Unrealized profit is not spendable.",
+		);
+	}
 	return {
-		version: 2,
+		version: 3,
 		profile: "a1",
 		externalCapital: MAX_EXTERNAL_CAPITAL,
-		realizedPnl: formatMoney(finiteMoney(record.realizedPnl)),
+		realizedPnl: realized,
 		allocated,
 		reservations,
+		appliedFills,
 	};
+}
+
+function parseAppliedFill(value: unknown): RiskRecord["appliedFills"][number] {
+	const record = object(value, "fill");
+	const text = (key: string) => {
+		const field = record[key];
+		if (typeof field !== "string" || field.trim() === "") {
+			throw new OlgaRefusal("Applied fill is unreadable.");
+		}
+		return field;
+	};
+	if (record.action !== "buy" && record.action !== "sell") {
+		throw new OlgaRefusal("Applied fill action is unreadable.");
+	}
+	const action: "buy" | "sell" = record.action;
+	const fill = {
+		fillId: text("fillId"),
+		clientOrderId: text("clientOrderId"),
+		action,
+		count: text("count"),
+		price: text("price"),
+		fee: text("fee"),
+		cashDelta: text("cashDelta"),
+	};
+	if (fill.cashDelta !== cashDeltaForFill(fill)) {
+		throw new OlgaRefusal(
+			"Applied fill cash does not match its price, count, and fee.",
+		);
+	}
+	return fill;
 }
 
 function parseReservation(value: unknown): Reservation {
@@ -522,24 +622,41 @@ function parseReservation(value: unknown): Reservation {
 		"side",
 		"action",
 		"count",
+		"filled",
+		"cancelled",
+		"exitReleased",
 		"price",
+		"feeType",
+		"feeMultiplier",
+		"balancePrecision",
+		"coveredFee",
+		"originNotional",
+		"originEntryFee",
+		"originExitFee",
+		"reservedNotional",
+		"reservedEntryFee",
+		"reservedExitFee",
 		"amount",
 		"state",
 	]);
-	if (
-		typeof record.id !== "string" ||
-		typeof record.clientOrderId !== "string" ||
-		typeof record.amount !== "string" ||
-		typeof record.count !== "string" ||
-		typeof record.price !== "string"
-	) {
-		throw new OlgaRefusal("Reservation identity or amount is unreadable.");
-	}
+	const text = (key: string) => {
+		const field = record[key];
+		if (typeof field !== "string") {
+			throw new OlgaRefusal("Reservation identity or amount is unreadable.");
+		}
+		return field;
+	};
 	if (record.side !== "yes" && record.side !== "no") {
 		throw new OlgaRefusal("Reservation side is unreadable.");
 	}
 	if (record.action !== "buy" && record.action !== "sell") {
 		throw new OlgaRefusal("Reservation action is unreadable.");
+	}
+	if (
+		record.balancePrecision !== "0.01" &&
+		record.balancePrecision !== "0.0001"
+	) {
+		throw new OlgaRefusal("Reservation fee precision is unreadable.");
 	}
 	if (
 		record.state !== "held" &&
@@ -549,15 +666,27 @@ function parseReservation(value: unknown): Reservation {
 	) {
 		throw new OlgaRefusal("Reservation state is unknown.");
 	}
-	const amount = positiveMoney(record.amount);
 	return {
-		id: record.id,
-		clientOrderId: record.clientOrderId,
+		id: text("id"),
+		clientOrderId: text("clientOrderId"),
 		side: record.side,
 		action: record.action,
-		count: formatCount(parseCount(record.count)),
-		price: formatMoney(positiveMoney(record.price)),
-		amount: formatMoney(amount),
+		count: text("count"),
+		filled: text("filled"),
+		cancelled: text("cancelled"),
+		exitReleased: text("exitReleased"),
+		price: text("price"),
+		feeType: text("feeType"),
+		feeMultiplier: text("feeMultiplier"),
+		balancePrecision: record.balancePrecision,
+		coveredFee: text("coveredFee"),
+		originNotional: text("originNotional"),
+		originEntryFee: text("originEntryFee"),
+		originExitFee: text("originExitFee"),
+		reservedNotional: text("reservedNotional"),
+		reservedEntryFee: text("reservedEntryFee"),
+		reservedExitFee: text("reservedExitFee"),
+		amount: text("amount"),
 		state: record.state,
 	};
 }

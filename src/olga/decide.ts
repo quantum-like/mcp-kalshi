@@ -36,8 +36,7 @@ export function decideOlga(
 		nowMs: number;
 		feedAtMs: number | null;
 		exchangeNowMs: number | null;
-		observedMachineId: string | null;
-		observedHome: string | null;
+		host: { machineId: string; home: string };
 		observed: ObservedIdentity;
 		profile?: string;
 	},
@@ -46,8 +45,8 @@ export function decideOlga(
 		return stop("Refusing to select the a2 profile.");
 	}
 	if (
-		input.observedMachineId !== OLGA_MACHINE_ID ||
-		input.observedHome !== OLGA_HOME ||
+		input.host.machineId !== OLGA_MACHINE_ID ||
+		input.host.home !== OLGA_HOME ||
 		state.owner.machineId !== OLGA_MACHINE_ID ||
 		state.owner.home !== OLGA_HOME ||
 		state.owner.fallback !== "forbidden"
@@ -202,8 +201,23 @@ function checkFreshness(
 			freeze: true,
 		};
 	}
-	if (input.nowMs + MAX_CLOCK_BACK_MS < state.clock.lastClockMs) {
-		return { ok: false, reason: "Clock moved backwards.", freeze: true };
+	if (input.nowMs <= state.clock.lastClockMs) {
+		return {
+			ok: false,
+			reason: "Clock watermark cannot move backwards.",
+			freeze: true,
+		};
+	}
+	if (
+		input.exchangeNowMs !== null &&
+		state.clock.lastExchangeMs !== null &&
+		input.exchangeNowMs <= state.clock.lastExchangeMs
+	) {
+		return {
+			ok: false,
+			reason: "Exchange clock watermark cannot move backwards.",
+			freeze: true,
+		};
 	}
 	if (input.nowMs - state.clock.lastClockMs > MAX_AWAKE_GAP_MS) {
 		return {
@@ -226,6 +240,44 @@ function checkFreshness(
 		};
 	}
 	return { ok: true };
+}
+
+export function clockAfterDecision(
+	clock: {
+		version: 2;
+		lastClockMs: number;
+		lastExchangeMs: number | null;
+		frozen: boolean;
+		freezeReason: string | null;
+	},
+	decision: OlgaDecision,
+	nowMs: number,
+	exchangeNowMs: number | null,
+): typeof clock | null {
+	if (decision.action === "WAIT" && exchangeNowMs !== null) {
+		if (nowMs <= clock.lastClockMs) return clock;
+		if (
+			clock.lastExchangeMs !== null &&
+			exchangeNowMs <= clock.lastExchangeMs
+		) {
+			return clock;
+		}
+		return {
+			...clock,
+			lastClockMs: nowMs,
+			lastExchangeMs: exchangeNowMs,
+			frozen: false,
+			freezeReason: null,
+		};
+	}
+	if (decision.freezeClock) {
+		return {
+			...clock,
+			frozen: true,
+			freezeReason: decision.reasons[0] ?? "halt",
+		};
+	}
+	return null;
 }
 
 function stop(reason: string, freezeClock = false): OlgaDecision {

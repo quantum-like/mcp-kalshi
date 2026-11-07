@@ -1,5 +1,16 @@
 # @iqai/mcp-kalshi
 
+## 0.1.8
+
+### Patch Changes
+
+- Reject saved zero or negative contract counts and holds below the
+  fee-inclusive quote. Realized profit changes only through an identified
+  fill. A sell reuses the buy's exit-fee hold instead of reserving it twice.
+  Partial fills release paid notional and entry fees from the original
+  amounts. The clock watermark never moves backward. Host identity is read
+  from the operating system, not from a caller string. Orders stay disabled.
+
 ## 0.1.7
 
 ### Patch Changes

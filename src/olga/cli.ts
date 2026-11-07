@@ -24,8 +24,6 @@ export async function main(argv: string[]): Promise<number> {
 		nowMs: Date.now(),
 		feedAtMs: null,
 		exchangeNowMs: null,
-		observedMachineId: null,
-		observedHome: null,
 		observed: {
 			apiKeyId: null,
 			memberId: null,

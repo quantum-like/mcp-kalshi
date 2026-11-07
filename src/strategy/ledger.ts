@@ -41,6 +41,11 @@ export interface StrategyIntent {
 	reservedNotional: string;
 	reservedEntryFee: string;
 	reservedExitFee: string;
+	originNotional: string;
+	originEntryFee: string;
+	originExitFee: string;
+	cancelledCount: string;
+	exitReleasedCount: string;
 	state: IntentState;
 	orderId?: string;
 	ackFillCount?: string;
@@ -178,31 +183,22 @@ export class StrategyLedger {
 			);
 			if (duplicate) return { intent: duplicate, created: false };
 			this.assertTradable(state, input);
-			const quote =
-				input.action === "buy"
-					? quoteBuyReservation({
-							count: input.count,
-							price: input.price,
-							multiplier: input.feeMultiplier,
-							precision: input.balancePrecision,
-							feeType: input.feeType,
-						})
-					: {
-							notional: "0.000000",
-							entryFee: quoteBuyReservation({
-								count: input.count,
-								price: input.price,
-								multiplier: input.feeMultiplier,
-								precision: input.balancePrecision,
-								feeType: input.feeType,
-							}).entryFee,
-							exitFee: "0.000000",
-							total: "0.000000",
-						};
+			const full = quoteBuyReservation({
+				count: input.count,
+				price: input.price,
+				multiplier: input.feeMultiplier,
+				precision: input.balancePrecision,
+				feeType: input.feeType,
+			});
+			const sellFee = parseMoney(full.entryFee);
+			const covered =
+				input.action === "sell"
+					? this.coveredExitHold(state, input.ticker, input.side)
+					: 0n;
+			const extraSellFee =
+				input.action === "sell" && sellFee > covered ? sellFee - covered : 0n;
 			const reserved =
-				input.action === "buy"
-					? parseMoney(quote.total)
-					: parseMoney(quote.entryFee);
+				input.action === "buy" ? parseMoney(full.total) : extraSellFee;
 			if (reserved > this.freeUnits(state)) {
 				throw new Error("Reservation exceeds the $5 strategy cash.");
 			}
@@ -215,9 +211,16 @@ export class StrategyLedger {
 				action: input.action,
 				count: formatCount(parseCount(input.count)),
 				price: formatMoney(parseMoney(input.price)),
-				reservedNotional: input.action === "buy" ? quote.notional : "0.000000",
-				reservedEntryFee: quote.entryFee,
-				reservedExitFee: input.action === "buy" ? quote.exitFee : "0.000000",
+				reservedNotional: input.action === "buy" ? full.notional : "0.000000",
+				reservedEntryFee:
+					input.action === "buy" ? full.entryFee : formatMoney(extraSellFee),
+				reservedExitFee: input.action === "buy" ? full.exitFee : "0.000000",
+				originNotional: input.action === "buy" ? full.notional : "0.000000",
+				originEntryFee:
+					input.action === "buy" ? full.entryFee : formatMoney(extraSellFee),
+				originExitFee: input.action === "buy" ? full.exitFee : "0.000000",
+				cancelledCount: "0.00",
+				exitReleasedCount: "0.00",
 				state: "submitting",
 			};
 			state.intents.push(intent);
@@ -244,16 +247,13 @@ export class StrategyLedger {
 			intent.orderId = ack.orderId;
 			intent.ackFillCount = ack.fillCount;
 			intent.ackRemaining = ack.remainingCount;
-			if (
-				ack.remainingCount === "0.00" &&
-				ack.fillCount &&
-				intent.action === "buy"
-			) {
+			if (ack.remainingCount === "0.00" && ack.fillCount) {
 				const requested = parseCount(intent.count);
 				const filled = parseCount(ack.fillCount);
 				const unfilled = requested - filled;
 				if (unfilled > 0n) {
-					this.releasePortion(intent, unfilled, requested);
+					intent.cancelledCount = formatCount(unfilled);
+					this.recomputeReservation(intent);
 				}
 			}
 			this.assertNonNegative(state);
@@ -293,13 +293,13 @@ export class StrategyLedger {
 			const fee = parseMoney(fill.fee);
 			if (fill.action === "buy") {
 				state.cash = formatMoney(parseMoney(state.cash) - notional - fee);
-				this.releasePortion(intent, count, parseCount(intent.count), "entry");
 			} else {
 				state.cash = formatMoney(parseMoney(state.cash) + notional - fee);
-				intent.reservedExitFee = "0.000000";
+				this.releaseExitCoverage(state, intent.ticker, intent.side, count);
 			}
 			const previous = intent.bookedCount ? parseCount(intent.bookedCount) : 0n;
 			intent.bookedCount = formatCount(previous + count);
+			this.recomputeReservation(intent);
 			state.appliedFillIds.push(fill.fillId);
 			intent.state = "reconciled";
 			this.assertNonNegative(state);
@@ -433,27 +433,69 @@ export class StrategyLedger {
 			}, 0n);
 	}
 
-	private releasePortion(
-		intent: StrategyIntent,
-		part: bigint,
-		whole: bigint,
-		which: "all" | "entry" = "all",
+	private coveredExitHold(
+		state: StrategyState,
+		ticker: string,
+		side: "yes" | "no",
+	): bigint {
+		return state.intents.reduce((sum, intent) => {
+			if (intent.state === "released" || intent.action !== "buy") return sum;
+			if (intent.ticker !== ticker || intent.side !== side) return sum;
+			return sum + parseMoney(intent.reservedExitFee);
+		}, 0n);
+	}
+
+	private releaseExitCoverage(
+		state: StrategyState,
+		ticker: string,
+		side: "yes" | "no",
+		sold: bigint,
 	): void {
-		if (whole <= 0n || part <= 0n) return;
-		const scale = (value: string) => (parseMoney(value) * part) / whole;
-		if (which === "all" || which === "entry") {
-			intent.reservedNotional = formatMoney(
-				parseMoney(intent.reservedNotional) - scale(intent.reservedNotional),
-			);
-			intent.reservedEntryFee = formatMoney(
-				parseMoney(intent.reservedEntryFee) - scale(intent.reservedEntryFee),
-			);
+		let left = sold;
+		for (const intent of state.intents) {
+			if (left <= 0n) break;
+			if (intent.state === "released" || intent.action !== "buy") continue;
+			if (intent.ticker !== ticker || intent.side !== side) continue;
+			const filled = intent.bookedCount ? parseCount(intent.bookedCount) : 0n;
+			const released = parseCount(intent.exitReleasedCount || "0.00");
+			const covering = filled - released;
+			if (covering <= 0n) continue;
+			const take = covering < left ? covering : left;
+			intent.exitReleasedCount = formatCount(released + take);
+			this.recomputeReservation(intent);
+			left -= take;
 		}
-		if (which === "all") {
+	}
+
+	/** Remaining holds are original amounts times the still-open fraction. */
+	private recomputeReservation(intent: StrategyIntent): void {
+		const requested = parseCount(intent.count);
+		if (requested <= 0n) {
+			throw new Error("Reservation count must be positive.");
+		}
+		const filled = intent.bookedCount ? parseCount(intent.bookedCount) : 0n;
+		const cancelled = parseCount(intent.cancelledCount || "0.00");
+		const exitReleased = parseCount(intent.exitReleasedCount || "0.00");
+		const resting = requested - filled - cancelled;
+		if (resting < 0n || exitReleased > filled) {
+			throw new Error("Fill accounting exceeds the original reservation.");
+		}
+		const originNotional = parseMoney(intent.originNotional);
+		const originEntry = parseMoney(intent.originEntryFee);
+		const originExit = parseMoney(intent.originExitFee);
+		const portion = (origin: bigint, size: bigint) =>
+			(origin * size) / requested;
+		if (intent.action === "buy") {
+			intent.reservedNotional = formatMoney(portion(originNotional, resting));
+			intent.reservedEntryFee = formatMoney(portion(originEntry, resting));
 			intent.reservedExitFee = formatMoney(
-				parseMoney(intent.reservedExitFee) - scale(intent.reservedExitFee),
+				portion(originExit, filled + resting - exitReleased),
 			);
+			return;
 		}
+		intent.reservedNotional = "0.000000";
+		intent.reservedEntryFee = formatMoney(portion(originEntry, resting));
+		intent.reservedExitFee = "0.000000";
 	}
 
 	private freeUnits(state: StrategyState): bigint {
