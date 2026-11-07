@@ -163,22 +163,14 @@ pnpm run build
 
 ## Deploying this fork
 
-This package is the `quantum-like/mcp-kalshi` fork. Do not publish it to npm and do not point a launcher at `@iqai/mcp-kalshi@0.1.1`.
+This package is the `quantum-like/mcp-kalshi` fork. It is not published to npm. The parent host installs the self-contained offline bundle, which already contains `dist/` and the production `node_modules` resolved from `pnpm-lock.yaml`.
 
-Build from this commit with the lockfile:
-
-```bash
-pnpm install --frozen-lockfile
-pnpm test
-pnpm run build
-```
-
-Point the existing stdio MCP configuration at the built server and keep the same credential environment variables:
+Extract that bundle and point the existing stdio MCP configuration at its server:
 
 ```json
 {
   "command": "node",
-  "args": ["/absolute/path/to/mcp-kalshi/dist/index.js"],
+  "args": ["/absolute/path/to/iqai-mcp-kalshi-0.1.2/dist/index.js"],
   "env": {
     "KALSHI_API_KEY": "your_api_key_here",
     "KALSHI_PRIVATE_KEY_PATH": "/absolute/path/to/private-key.pem"
@@ -186,9 +178,11 @@ Point the existing stdio MCP configuration at the built server and keep the same
 }
 ```
 
-The base URL stays `https://api.elections.kalshi.com/trade-api/v2`. Swapping this command is an operator step. This repository does not restart a running connector, place an order, or change any schedule.
+`KALSHI_PRIVATE_KEY_PEM` can be used instead of `KALSHI_PRIVATE_KEY_PATH`. The base URL stays `https://api.elections.kalshi.com/trade-api/v2`. Swapping this command is an operator step. This repository does not restart a running connector, place an order, or change any schedule.
 
-Rollback: point the same MCP configuration back at the previous build, or check out commit `15c12b37ed9f1b0e3fc0000e4918e9191c2b282b` and rebuild. Leave any external monitor-only hold in place until that hold is cleared by its own procedure.
+Pinned production versions inside the bundle: `dedent@1.6.0`, `fastmcp@3.30.1`, `kalshi-typescript@3.35.0`, `zod@3.25.7`, `axios@1.21.0`.
+
+Rollback: point the same MCP configuration back at the previous server binary. Leave any external monitor-only hold in place until that hold is cleared by its own procedure. The pre-repair source revision is `15c12b37ed9f1b0e3fc0000e4918e9191c2b282b`.
 
 ### 📁 Project Structure
 *   `src/tools/`: Individual tool definitions
