@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { acquireHostLock } from "../src/olga/lock.js";
 import {
 	applyOlgaFill,
 	initializeDisabledCandidate,
 	loadOlgaState,
+	markSubmitting,
+	releaseUnsent,
 	reserve,
 	spendableUnits,
 } from "../src/olga/state.js";
@@ -21,6 +25,7 @@ function order(
 ) {
 	return {
 		clientOrderId: id,
+		ticker: "KXBTC15M-FAKE",
 		side: "yes" as const,
 		action,
 		count,
@@ -39,6 +44,7 @@ function fill(
 	return {
 		fillId: `fill-${id}`,
 		clientOrderId: id,
+		ticker: "KXBTC15M-FAKE",
 		action,
 		count: "1.00",
 		price: "0.500000",
@@ -229,6 +235,96 @@ test("a forged release cannot erase an open buy, and released history stays fini
 			assert.equal(loaded.ok, false, field);
 		}
 	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("market identity is required and a different ticker cannot book or cover inventory", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		assert.throws(
+			() => reserve(risk, { ...order("bare"), ticker: "" }),
+			/ticker/i,
+		);
+		const reserved = reserve(risk, order("A-buy"));
+		assert.equal(reserved.reservations[0]?.ticker, "KXBTC15M-FAKE");
+		assert.throws(
+			() =>
+				applyOlgaFill(
+					reserved,
+					fill("A-buy", "buy", { ticker: "KXBTC15M-FAKE-B" }),
+				),
+			/market|instrument/i,
+		);
+		const bought = applyOlgaFill(reserved, fill("A-buy"));
+		assert.throws(
+			() =>
+				reserve(bought, {
+					...order("B-sell", "sell"),
+					ticker: "KXBTC15M-FAKE-B",
+				}),
+			/no bought position|naked sell/i,
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("unsent release cancels the resting hold and tampered exits or duplicate ids fail", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const reserved = reserve(risk, order("buy"));
+		const submitting = markSubmitting(reserved, "buy");
+		const released = releaseUnsent(submitting, "buy", true);
+		assert.equal(released.reservations[0]?.state, "released");
+		assert.equal(released.allocated, "0.000000");
+		assert.equal(spendableUnits(released), 5_000000n);
+		const bought = applyOlgaFill(reserve(risk, order("held")), fill("held"));
+		const erased = structuredClone(bought);
+		erased.reservations[0].exitReleased = "1.00";
+		erased.reservations[0].reservedExitFee = "0.000000";
+		erased.reservations[0].amount = "0.000000";
+		erased.allocated = "0.000000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(erased));
+		const exitGone = await loadOlgaState(directory);
+		assert.equal(exitGone.ok, false);
+		const linked = reserve(bought, {
+			...order("sell", "sell"),
+			feeMultiplier: "2.000000",
+		});
+		assert.notEqual(linked.reservations[1]?.amount, "0.000000");
+		const widened = structuredClone(linked);
+		const sellRow = widened.reservations[1];
+		assert.ok(sellRow);
+		if (!sellRow) return;
+		sellRow.originEntryFee = "0.000000";
+		sellRow.reservedEntryFee = "0.000000";
+		sellRow.amount = "0.000000";
+		widened.allocated = widened.reservations[0]?.amount ?? "0.000000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(widened));
+		const feeGone = await loadOlgaState(directory);
+		assert.equal(feeGone.ok, false);
+		const cloned = structuredClone(reserved);
+		cloned.reservations.push({ ...cloned.reservations[0] });
+		cloned.allocated = "1.110000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(cloned));
+		const duplicate = await loadOlgaState(directory);
+		assert.equal(duplicate.ok, false);
+		assert.match(duplicate.ok ? "" : duplicate.reason, /Duplicate reservation/);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("replacing the lock file path does not admit a second holder", async () => {
+	const { directory } = await freshRisk();
+	const lockPath = join(directory, "olga-host.sqlite");
+	const first = await acquireHostLock(lockPath);
+	try {
+		await unlink(lockPath);
+		await assert.rejects(acquireHostLock(lockPath), /No fallback host/);
+	} finally {
+		await first.release();
 		await rm(directory, { recursive: true, force: true });
 	}
 });

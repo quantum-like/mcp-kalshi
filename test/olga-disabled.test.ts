@@ -69,6 +69,7 @@ function order(
 ) {
 	return {
 		clientOrderId: id,
+		ticker: "KXBTC15M-FAKE",
 		action,
 		side,
 		count,
@@ -137,6 +138,7 @@ test("external capital stays 5 while realized profit is reusable and losses dedu
 		cycle = applyOlgaFill(cycle, {
 			fillId: "cycle-buy-fill",
 			clientOrderId: "cycle-buy",
+			ticker: "KXBTC15M-FAKE",
 			action: "buy",
 			count: "1.00",
 			price: "0.500000",
@@ -152,6 +154,7 @@ test("external capital stays 5 while realized profit is reusable and losses dedu
 		cycle = applyOlgaFill(cycle, {
 			fillId: "cycle-sell-fill",
 			clientOrderId: "cycle-sell",
+			ticker: "KXBTC15M-FAKE",
 			action: "sell",
 			count: "1.00",
 			price: "0.800000",

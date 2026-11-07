@@ -14,11 +14,25 @@ import { OlgaRefusal, type Reservation, type ReserveInput } from "./state.js";
 export interface OlgaFill {
 	fillId: string;
 	clientOrderId: string;
+	ticker: string;
 	action: "buy" | "sell";
 	count: string;
 	price: string;
 	fee: string;
 	cashDelta: string;
+}
+
+function marketKey(ticker: string, side: string): string {
+	return `${ticker}\n${side}`;
+}
+
+function requireTicker(ticker: string): string {
+	if (typeof ticker !== "string" || ticker.trim() === "") {
+		throw new OlgaRefusal(
+			"Market ticker is required. A missing instrument is not a position.",
+		);
+	}
+	return ticker;
 }
 
 export function positiveCount(input: string): bigint {
@@ -156,10 +170,20 @@ function restingCount(reservation: Reservation): bigint {
 }
 
 export function auditReservations(reservations: Reservation[]): void {
+	const ids = new Set<string>();
+	const clientIds = new Set<string>();
 	const exitPool = new Map<string, bigint>();
 	const buyCapacity = new Map<string, bigint>();
 	const sellUsed = new Map<string, bigint>();
 	for (const reservation of reservations) {
+		requireTicker(reservation.ticker);
+		if (ids.has(reservation.id) || clientIds.has(reservation.clientOrderId)) {
+			throw new OlgaRefusal(
+				"Duplicate reservation identity. One order cannot be represented twice.",
+			);
+		}
+		ids.add(reservation.id);
+		clientIds.add(reservation.clientOrderId);
 		assertMoneyFields(reservation);
 		const resting = restingCount(reservation);
 		if (resting < 0n) {
@@ -167,6 +191,7 @@ export function auditReservations(reservations: Reservation[]): void {
 				"Fill accounting exceeds the original reservation.",
 			);
 		}
+		const key = marketKey(reservation.ticker, reservation.side);
 		if (reservation.action === "buy") {
 			recomputeBuy(reservation);
 			const closed =
@@ -177,7 +202,6 @@ export function auditReservations(reservations: Reservation[]): void {
 				);
 			}
 			if (reservation.state === "released") continue;
-			const key = reservation.side;
 			exitPool.set(
 				key,
 				(exitPool.get(key) ?? 0n) + parseMoney(reservation.reservedExitFee),
@@ -196,6 +220,10 @@ export function auditReservations(reservations: Reservation[]): void {
 		if (reservation.originNotional !== "0.000000") {
 			throw new OlgaRefusal("A sell does not reserve a second notional.");
 		}
+		const requiredFee = parseMoney(buyQuote(reservation).entryFee);
+		if (originCovered + originAdditional !== requiredFee) {
+			throw new OlgaRefusal("Sell fee hold does not match its fee schedule.");
+		}
 		if (reservation.state === "released") {
 			if (resting !== 0n || reservation.amount !== "0.000000") {
 				throw new OlgaRefusal(
@@ -211,7 +239,6 @@ export function auditReservations(reservations: Reservation[]): void {
 				"Sell reservation does not match the uncovered exit fee.",
 			);
 		}
-		const key = reservation.side;
 		const available = exitPool.get(key) ?? 0n;
 		if (remainingCovered > available) {
 			throw new OlgaRefusal(
@@ -233,6 +260,33 @@ export function auditReservations(reservations: Reservation[]): void {
 	}
 }
 
+export function cancelUnsentReservation(reservation: Reservation): Reservation {
+	if (reservation.state === "unknown") {
+		throw new OlgaRefusal(
+			"Unknown order outcome stays reserved. Refusing to release or retry it.",
+		);
+	}
+	if (reservation.state !== "submitting") {
+		throw new OlgaRefusal(
+			"Only an unsent submitting reservation can be released.",
+		);
+	}
+	const next: Reservation = {
+		...reservation,
+		cancelled: formatCount(
+			nonNegativeCount(reservation.cancelled) + restingCount(reservation),
+		),
+	};
+	if (next.action === "buy") syncBuy(next);
+	else syncSell(next);
+	if (next.amount === "0.000000" && next.reservedExitFee === "0.000000") {
+		next.state = "released";
+	} else {
+		next.state = "held";
+	}
+	return next;
+}
+
 export function createReservation(
 	input: ReserveInput,
 	existing: Reservation[],
@@ -245,6 +299,7 @@ export function createReservation(
 		const reservation: Reservation = {
 			id: randomUUID(),
 			clientOrderId: input.clientOrderId,
+			ticker: requireTicker(input.ticker),
 			side: input.side,
 			action: "buy",
 			count,
@@ -271,6 +326,7 @@ export function createReservation(
 	const probe: Reservation = {
 		id: randomUUID(),
 		clientOrderId: input.clientOrderId,
+		ticker: requireTicker(input.ticker),
 		side: input.side,
 		action: "sell",
 		count,
@@ -296,13 +352,19 @@ export function createReservation(
 	const needed = parseMoney(quote.entryFee);
 	let pool = 0n;
 	for (const reservation of existing) {
-		if (reservation.state === "released" || reservation.side !== input.side) {
+		if (
+			reservation.state === "released" ||
+			reservation.side !== input.side ||
+			reservation.ticker !== input.ticker
+		) {
 			continue;
 		}
 		if (reservation.action === "buy") {
 			pool += parseMoney(reservation.reservedExitFee);
 		} else {
-			pool -= parseMoney(reservation.coveredFee);
+			const requested = positiveCount(reservation.count);
+			const resting = restingCount(reservation);
+			pool -= scale(parseMoney(reservation.coveredFee), resting, requested);
 		}
 	}
 	if (pool < 0n) pool = 0n;
@@ -367,9 +429,9 @@ export function assertFillLedger(
 				item.clientOrderId === fill.clientOrderId &&
 				item.action === fill.action,
 		);
-		if (!reservation) {
+		if (!reservation || reservation.ticker !== requireTicker(fill.ticker)) {
 			throw new OlgaRefusal(
-				"Fill does not match a reservation. Saved profit without a position is rejected.",
+				"Fill does not match the reserved market. Another instrument cannot book this order.",
 			);
 		}
 		const price = tradePrice(fill.price);
@@ -400,15 +462,16 @@ export function assertFillLedger(
 			);
 		}
 		filledByOrder.set(key, nextFilled);
-		const held = owned.get(reservation.side) ?? 0n;
+		const book = marketKey(reservation.ticker, reservation.side);
+		const held = owned.get(book) ?? 0n;
 		if (fill.action === "buy") {
-			owned.set(reservation.side, held + size);
+			owned.set(book, held + size);
 		} else if (size > held) {
 			throw new OlgaRefusal(
 				"Sell fill has no bought position. A naked sell cannot create cash.",
 			);
 		} else {
-			owned.set(reservation.side, held - size);
+			owned.set(book, held - size);
 		}
 		sum += parseMoney(fill.cashDelta);
 	}
@@ -425,6 +488,34 @@ export function assertFillLedger(
 		throw new OlgaRefusal(
 			"Realized profit is not the sum of identified fills. Unrealized profit is not spendable.",
 		);
+	}
+	const sold = new Map<string, bigint>();
+	for (const fill of fills) {
+		if (fill.action !== "sell") continue;
+		const reservation = reservations.find(
+			(item) =>
+				item.clientOrderId === fill.clientOrderId && item.action === "sell",
+		);
+		if (!reservation) continue;
+		const book = marketKey(reservation.ticker, reservation.side);
+		sold.set(book, (sold.get(book) ?? 0n) + positiveCount(fill.count));
+	}
+	const released = new Map<string, bigint>();
+	for (const reservation of reservations) {
+		if (reservation.action !== "buy") continue;
+		const book = marketKey(reservation.ticker, reservation.side);
+		released.set(
+			book,
+			(released.get(book) ?? 0n) + nonNegativeCount(reservation.exitReleased),
+		);
+	}
+	const books = new Set([...sold.keys(), ...released.keys()]);
+	for (const book of books) {
+		if ((sold.get(book) ?? 0n) !== (released.get(book) ?? 0n)) {
+			throw new OlgaRefusal(
+				"Exit hold does not match identified sells. Owned inventory cannot be erased.",
+			);
+		}
 	}
 }
 
@@ -444,8 +535,14 @@ export function applyFillToReservations(
 	const intent = next.find(
 		(reservation) => reservation.clientOrderId === fill.clientOrderId,
 	);
-	if (!intent || intent.action !== fill.action) {
-		throw new OlgaRefusal("Fill does not match a strategy reservation.");
+	if (
+		!intent ||
+		intent.action !== fill.action ||
+		intent.ticker !== requireTicker(fill.ticker)
+	) {
+		throw new OlgaRefusal(
+			"Fill does not match the reserved market. Another instrument cannot book this order.",
+		);
 	}
 	const add = positiveCount(fill.count);
 	const filled = nonNegativeCount(intent.filled) + add;
@@ -469,7 +566,13 @@ export function applyFillToReservations(
 	if (fill.action === "sell") {
 		let owned = 0n;
 		for (const buy of next) {
-			if (buy.action !== "buy" || buy.side !== intent.side) continue;
+			if (
+				buy.action !== "buy" ||
+				buy.side !== intent.side ||
+				buy.ticker !== intent.ticker
+			) {
+				continue;
+			}
 			if (buy.state === "released") continue;
 			owned +=
 				nonNegativeCount(buy.filled) - nonNegativeCount(buy.exitReleased);
@@ -481,7 +584,12 @@ export function applyFillToReservations(
 		}
 		let left = add;
 		for (const buy of next) {
-			if (left <= 0n || buy.action !== "buy" || buy.side !== intent.side) {
+			if (
+				left <= 0n ||
+				buy.action !== "buy" ||
+				buy.side !== intent.side ||
+				buy.ticker !== intent.ticker
+			) {
 				continue;
 			}
 			if (buy.state === "released") continue;

@@ -288,6 +288,14 @@ export class StrategyLedger {
 			if (!intent) {
 				throw new Error("Fill does not match a strategy intent.");
 			}
+			if (fill.ticker !== intent.ticker) {
+				throw new Error(
+					"Fill ticker does not match the reserved market. Refusing to book another instrument.",
+				);
+			}
+			if (fill.outcomeSide !== intent.side) {
+				throw new Error("Fill outcome does not match the reserved side.");
+			}
 			const count = parseCount(fill.count);
 			const notional = (parseMoney(fill.price) * count) / 100n;
 			const fee = parseMoney(fill.fee);

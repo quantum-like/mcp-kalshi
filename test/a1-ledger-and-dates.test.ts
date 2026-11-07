@@ -277,6 +277,19 @@ test("timeout freezes the intent, does not retry, and survives a restart", async
 		const flat = await restarted.status();
 		assert.equal(flat.cash, "4.960000");
 		assert.equal(restarted.freeCash(flat), "4.960000");
+		await assert.rejects(
+			restarted.applyFill({
+				fillId: "other-market",
+				clientOrderId: "flat-buy",
+				ticker: "KXBTC15M-OTHER",
+				outcomeSide: "yes",
+				count: "1.00",
+				price: "0.500000",
+				fee: "0.010000",
+				action: "buy",
+			}),
+			/ticker|market/i,
+		);
 		const ack = await executeOnce(
 			restarted,
 			intent({ clientOrderId: "ioc" }),

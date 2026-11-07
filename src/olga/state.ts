@@ -18,6 +18,7 @@ import {
 	applyFillToReservations,
 	assertFillLedger,
 	auditReservations,
+	cancelUnsentReservation,
 	cashDeltaForFill,
 	createReservation,
 } from "./positions.js";
@@ -53,6 +54,7 @@ export type ReservationState = "held" | "submitting" | "unknown" | "released";
 export interface Reservation {
 	id: string;
 	clientOrderId: string;
+	ticker: string;
 	side: "yes" | "no";
 	action: "buy" | "sell";
 	count: string;
@@ -76,6 +78,7 @@ export interface Reservation {
 
 export interface ReserveInput {
 	clientOrderId: string;
+	ticker: string;
 	side: "yes" | "no";
 	action: "buy" | "sell";
 	count: string;
@@ -103,6 +106,7 @@ export interface RiskRecord {
 	appliedFills: Array<{
 		fillId: string;
 		clientOrderId: string;
+		ticker: string;
 		action: "buy" | "sell";
 		count: string;
 		price: string;
@@ -383,6 +387,7 @@ export function applyOlgaFill(
 	fill: {
 		fillId: string;
 		clientOrderId: string;
+		ticker: string;
 		action: "buy" | "sell";
 		count: string;
 		price: string;
@@ -457,19 +462,9 @@ export function releaseUnsent(
 			"Incomplete read. The reservation stays frozen and is not retried.",
 		);
 	}
-	return mapReservation(risk, clientOrderId, (reservation) => {
-		if (reservation.state === "unknown") {
-			throw new OlgaRefusal(
-				"Unknown order outcome stays reserved. Refusing to release or retry it.",
-			);
-		}
-		if (reservation.state !== "submitting") {
-			throw new OlgaRefusal(
-				"Only an unsent submitting reservation can be released.",
-			);
-		}
-		return { ...reservation, state: "released" };
-	});
+	return mapReservation(risk, clientOrderId, (reservation) =>
+		cancelUnsentReservation(reservation),
+	);
 }
 
 function mapReservation(
@@ -593,6 +588,7 @@ function parseAppliedFill(value: unknown): RiskRecord["appliedFills"][number] {
 	const fill = {
 		fillId: text("fillId"),
 		clientOrderId: text("clientOrderId"),
+		ticker: text("ticker"),
 		action,
 		count: text("count"),
 		price: text("price"),
@@ -612,6 +608,7 @@ function parseReservation(value: unknown): Reservation {
 	rejectExtra(record, [
 		"id",
 		"clientOrderId",
+		"ticker",
 		"side",
 		"action",
 		"count",
@@ -662,6 +659,7 @@ function parseReservation(value: unknown): Reservation {
 	return {
 		id: text("id"),
 		clientOrderId: text("clientOrderId"),
+		ticker: text("ticker"),
 		side: record.side,
 		action: record.action,
 		count: text("count"),

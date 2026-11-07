@@ -1,5 +1,17 @@
 # @iqai/mcp-kalshi
 
+## 0.1.10
+
+### Patch Changes
+
+- Bind every reservation and fill to a market ticker. A missing ticker or a
+  different instrument cannot book or cover inventory. Exit holds must match
+  identified sells. A sell's covered fee plus its extra fee must equal its
+  own fee quote. Duplicate reservation ids are rejected. An unsent
+  submitting order can be released by cancelling the resting size. The host
+  lock is the state directory inode, so replacing the lock file path does
+  not admit a second holder. Orders stay disabled.
+
 ## 0.1.9
 
 ### Patch Changes
