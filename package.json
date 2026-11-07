@@ -22,6 +22,7 @@
 		"access": "public"
 	},
 	"dependencies": {
+		"axios": "1.21.0",
 		"dedent": "^1.6.0",
 		"fastmcp": "^3.30.1",
 		"kalshi-typescript": "3.35.0",
@@ -29,7 +30,6 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "*",
-		"axios": "1.21.0",
 		"@changesets/cli": "^2.29.4",
 		"@types/node": "^22.15.19",
 		"husky": "^9.0.0",
