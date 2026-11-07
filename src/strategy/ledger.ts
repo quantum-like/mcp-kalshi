@@ -402,7 +402,10 @@ export class StrategyLedger {
 			}
 		}
 		const open = state.intents.some(
-			(intent) => intent.state === "submitting" || intent.state === "unknown",
+			(intent) =>
+				intent.state === "submitting" ||
+				intent.state === "unknown" ||
+				intent.state === "acknowledged",
 		);
 		if (open) {
 			throw new Error(

@@ -28,6 +28,7 @@ export function createA1Tools(
 					`balance_cents: ${view.balance_cents}`,
 					`portfolio_value_cents: ${view.portfolio_value_cents}`,
 					`updated: ${view.updated}`,
+					`conflicts: ${view.conflicts.length ? view.conflicts.join("; ") : "none"}`,
 					"--- json ---",
 					JSON.stringify(view),
 				].join("\n");

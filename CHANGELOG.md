@@ -1,5 +1,20 @@
 # @iqai/mcp-kalshi
 
+## 0.1.4
+
+### Patch Changes
+
+- Default the server to a disarmed read-only a1 profile. Mutation tools are not
+  registered, and direct create, cancel, decrease, and batch calls throw before
+  any SDK client is constructed. `KALSHI_MCP_PROFILE=a2` is the explicit opt-in
+  that keeps the deployed 0.1.2 order behavior.
+- Require a fresh per-market price grid for every a1 cent or dollar price.
+  Off-grid and stale prices are rejected and are not rounded onto the grid.
+- Recover unknown intents only by scanning complete order and fill reads.
+  That recovery never submits again.
+- Quarantine every dated record until an operator config names the source
+  clock. The guard does not treat Los Angeles dates as the original holdout.
+
 ## 0.1.3
 
 ### Patch Changes

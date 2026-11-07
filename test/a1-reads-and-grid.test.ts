@@ -244,6 +244,7 @@ test("legacy cent create acknowledgement is unchanged and keeps a caller id", as
 	const { OrdersApi } = await import("kalshi-typescript");
 	const tools = createOrderTools(
 		new OrdersService({
+			profile: "a2",
 			ordersApi: new OrdersApi(undefined, OFFLINE_BASE, http),
 			createClientOrderId: () => "generated",
 		}),

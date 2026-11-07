@@ -161,9 +161,23 @@ pnpm run build
 
 `pnpm test` uses a mocked Axios transport. It does not call Kalshi and it does not prove the exchange accepted an order.
 
+## Profiles
+
+`KALSHI_MCP_PROFILE` defaults to `a1`. That process registers read tools only. Create, cancel, decrease, and batch-cancel are absent from the tool list, and calling those service methods throws before an SDK client exists. The a1 strategy submit function, which is not registered as a tool, checks a fresh price grid and then the persistent ledger before it can call a transport. A disarmed ledger, the default, never reaches that call.
+
+`KALSHI_MCP_PROFILE=a2` is the explicit compatibility profile for the deployed connector. It keeps the 0.1.2 whole-cent create path, including orders that do not carry `price_ranges`. Do not point the running a2 process at this bundle unless that profile is selected on purpose. The default a1 profile will not place those orders.
+
+The offline bundle ships compiled tests. From the extracted directory, with no install and no network:
+
+```bash
+node offline-accept.mjs
+```
+
+That command exits nonzero if it discovers zero tests or a count other than the number in `EXPECTED_TESTS`. It does not call Kalshi.
+
 ## A1 readiness (disarmed)
 
-Version 0.1.3 adds read and accounting tools without changing the 0.1.2 order acknowledgement, cancel routing, or whole-cent create path.
+Version 0.1.4 keeps the 0.1.2 acknowledgement text for a2-profile cent orders.
 
 - `READ_BALANCE`, `READ_POSITIONS`, `READ_ORDERS`, `READ_FILLS`, and `READ_SETTLEMENTS` report fixed-point strings, full ids, cursors, and completeness. A missing number is `UNKNOWN`. A failed page is not an empty account.
 - `CREATE_ORDER` accepts an optional `clientOrderId`. Omitting it still generates one id for that call and does not retry. Optional dollar prices require `priceRanges` observed at `priceObservedAt`. Legacy cent fields stay whole cents and are not reinterpreted as dollars.

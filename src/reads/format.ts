@@ -1,3 +1,4 @@
+import { parseMoney } from "../lib/fixed.js";
 import { formatPacific } from "../lib/pst.js";
 import type { ReadPage } from "./paginate.js";
 
@@ -91,7 +92,24 @@ export function viewBalance(balance: Record<string, unknown>): {
 	balance_cents: string;
 	portfolio_value_cents: string;
 	updated: string;
+	conflicts: string[];
 } {
+	const conflicts: string[] = [];
+	if (
+		typeof balance.balance === "number" &&
+		typeof balance.balance_dollars === "string"
+	) {
+		try {
+			const fromCents = BigInt(balance.balance) * 10_000n;
+			if (fromCents !== parseMoney(balance.balance_dollars)) {
+				conflicts.push(
+					"balance integer cents disagree with balance_dollars; accounting keeps balance_dollars",
+				);
+			}
+		} catch {
+			conflicts.push("balance_dollars is not a fixed-point dollar string");
+		}
+	}
 	return {
 		balance_dollars: decimal(balance.balance_dollars, "dollars"),
 		balance_cents:
@@ -105,6 +123,7 @@ export function viewBalance(balance: Record<string, unknown>): {
 		updated: stamp(
 			typeof balance.updated_ts === "number" ? balance.updated_ts : undefined,
 		),
+		conflicts,
 	};
 }
 

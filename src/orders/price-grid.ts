@@ -147,6 +147,61 @@ export function toGridCreateOrder(
 	};
 }
 
+function legacyCentsToDollars(cents: number, label: string): string {
+	if (!Number.isSafeInteger(cents) || cents < 1 || cents > 99) {
+		throw new Error(`${label} must be a whole-cent legacy price from 1 to 99`);
+	}
+	return formatMoney(BigInt(cents) * 10_000n);
+}
+
+/**
+ * Shared gate for every a1 price, whether the caller used legacy cents or
+ * dollar strings. Missing, stale, and off-grid prices throw before any order
+ * exists. Nothing is snapped onto the grid.
+ */
+export function prepareA1Limit(
+	input: GridLimitInput,
+	now = input.now ?? new Date(),
+): { request: CreateOrderV2Request; paidPrice: string } {
+	if (!input.priceRanges?.length) {
+		throw new Error(
+			"Price grid metadata is absent. Refusing to price without price_ranges.",
+		);
+	}
+	assertFreshMetadata(input.priceObservedAt, now, input.maxMetadataAgeMs);
+	const cents = input.side === "yes" ? input.yesPrice : input.noPrice;
+	const dollars =
+		input.side === "yes" ? input.yesPriceDollars : input.noPriceDollars;
+	if (cents !== undefined && dollars !== undefined) {
+		throw new Error("Do not mix legacy cent prices with dollar prices.");
+	}
+	const selected =
+		dollars ??
+		(cents === undefined
+			? undefined
+			: legacyCentsToDollars(
+					cents,
+					input.side === "yes" ? "yesPrice" : "noPrice",
+				));
+	if (!selected) {
+		throw new Error(
+			"Selected outcome requires a limit price on the current grid.",
+		);
+	}
+	const request = toGridCreateOrder(
+		{
+			...input,
+			yesPrice: undefined,
+			noPrice: undefined,
+			yesPriceDollars: input.side === "yes" ? selected : undefined,
+			noPriceDollars: input.side === "no" ? selected : undefined,
+			now,
+		},
+		now,
+	);
+	return { request, paidPrice: formatMoney(parseMoney(selected)) };
+}
+
 export function usesDollarPrices(input: {
 	yesPriceDollars?: string;
 	noPriceDollars?: string;

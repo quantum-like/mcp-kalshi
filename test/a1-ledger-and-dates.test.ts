@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+	type AuthoritativeDatePolicy,
 	DATA_GUARD_DEFAULTS,
+	calendarDateInZone,
 	screenRecord,
 } from "../src/data-guard/sealed-window.js";
 import { ENFORCEMENT_BOUNDARY } from "../src/strategy/boundary.js";
@@ -238,47 +240,112 @@ test("timeout freezes the intent, does not retry, and survives a restart", async
 	}
 });
 
-test("sealed and cross-boundary records are rejected before payload decoding", () => {
+const fixturePolicy: AuthoritativeDatePolicy = {
+	authoritative: true,
+	timeZone: "UTC",
+	sealedStart: "2026-08-01",
+	sealedEnd: "2026-10-07",
+	quarantineDates: ["2026-10-08"],
+	clockMeaning: "observation",
+};
+
+test("unconfigured dates are quarantined and do not claim a study timezone", () => {
 	let decoded = 0;
 	const decode = () => {
 		decoded += 1;
 		return { secret: "value" };
 	};
+	for (const start of [
+		"2026-08-01T00:30:00.000Z",
+		"2026-10-07T23:30:00.000Z",
+		"2026-10-08T00:30:00.000Z",
+		"2026-10-09T12:00:00.000Z",
+		"2026-11-01T08:30:00.000Z",
+		"2026-03-08T09:30:00.000Z",
+	]) {
+		const result = screenRecord(
+			{ id: start, start, payload: { n: 1 } },
+			decode,
+		);
+		assert.equal(result.decision, "quarantine");
+		assert.match(result.reason ?? "", /Authoritative source calendar/);
+	}
 	assert.equal(
-		screenRecord({ id: "a", start: "2026-08-01T20:00:00.000Z" }, decode)
-			.decision,
+		screenRecord(
+			{
+				id: "mixed",
+				kind: "mixed-summary",
+				start: "2026-10-09T00:00:00.000Z",
+			},
+			decode,
+		).decision,
+		"reject",
+	);
+	assert.equal(decoded, 0);
+	const boundary = "2026-10-08T06:30:00.000Z";
+	assert.equal(calendarDateInZone(boundary, "UTC"), "2026-10-08");
+	assert.equal(
+		calendarDateInZone(boundary, "America/Los_Angeles"),
+		"2026-10-07",
+	);
+	assert.equal(DATA_GUARD_DEFAULTS.mode, "000");
+	assert.deepEqual([...DATA_GUARD_DEFAULTS.historicalDays], []);
+});
+
+test("an explicit fixture policy can seal a window without being the source clock", () => {
+	let decoded = 0;
+	const decode = () => {
+		decoded += 1;
+		return { ok: true };
+	};
+	assert.equal(
+		screenRecord(
+			{ id: "a", start: "2026-08-01T00:30:00.000Z" },
+			decode,
+			fixturePolicy,
+		).decision,
 		"sealed",
 	);
 	assert.equal(
-		screenRecord({ id: "b", start: "2026-10-07T20:00:00.000Z" }, decode)
-			.decision,
+		screenRecord(
+			{ id: "b", start: "2026-10-07T23:00:00.000Z" },
+			decode,
+			fixturePolicy,
+		).decision,
 		"sealed",
 	);
 	assert.equal(
-		screenRecord({ id: "c", start: "2026-10-08T20:00:00.000Z" }, decode)
-			.decision,
+		screenRecord(
+			{ id: "c", start: "2026-10-08T00:30:00.000Z" },
+			decode,
+			fixturePolicy,
+		).decision,
 		"quarantine",
 	);
 	assert.equal(
-		screenRecord({ id: "d", start: undefined }, decode).decision,
+		screenRecord({ id: "d", start: "not-a-date" }, decode, fixturePolicy)
+			.decision,
 		"reject",
 	);
 	assert.equal(
 		screenRecord(
 			{
 				id: "e",
-				start: "2026-10-07T20:00:00.000Z",
-				end: "2026-10-09T20:00:00.000Z",
+				start: "2026-10-07T12:00:00.000Z",
+				end: "2026-10-09T12:00:00.000Z",
 			},
 			decode,
+			fixturePolicy,
 		).decision,
 		"reject",
 	);
-	const allowed = screenRecord(
-		{ id: "f", start: "2026-10-09T20:00:00.000Z", payload: { n: 1 } },
-		decode,
+	assert.equal(
+		screenRecord(
+			{ id: "f", start: "2026-10-09T12:00:00.000Z", payload: { n: 1 } },
+			decode,
+			fixturePolicy,
+		).decision,
+		"allow",
 	);
-	assert.equal(allowed.decision, "allow");
 	assert.equal(decoded, 1);
-	assert.equal(DATA_GUARD_DEFAULTS.mode, "000");
 });
