@@ -101,7 +101,7 @@ test("a missing deduped hash is an integrity incident before HTTP and bytes stay
 });
 
 test("mac harness blocks native gates on this host and keeps the linux adapter fail-closed", async () => {
-	const child = spawn(process.execPath, [fileURLToPath(new URL("../harness/mac-accept.mjs", import.meta.url))], {
+	const child = spawn(process.execPath, [fileURLToPath(new URL("../mac/mac-accept.mjs", import.meta.url))], {
 		cwd: fileURLToPath(new URL("../..", import.meta.url)),
 		stdio: ["ignore", "pipe", "pipe"],
 	});
