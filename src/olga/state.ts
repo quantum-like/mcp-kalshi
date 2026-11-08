@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, readFile, readdir, rename, stat } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import {
+	open,
+	readFile,
+	readdir,
+	realpath,
+	rename,
+	stat,
+} from "node:fs/promises";
+import { basename, dirname, join, sep } from "node:path";
 import {
 	formatCount,
 	formatMoney,
@@ -223,10 +231,16 @@ export async function initializeDisabledCandidate(
 	if (!Number.isFinite(nowMs)) {
 		throw new OlgaRefusal("Refusing to initialize without a finite clock.");
 	}
-	const present = await existingStateFiles(directory);
+	const root = await realpath(directory);
+	const present = await existingStateFiles(root);
 	if (present.length > 0) {
 		throw new OlgaRefusal(
 			"Olga state already exists. Refusing to reset or replenish it.",
+		);
+	}
+	if (await anchorExists(root)) {
+		throw new OlgaRefusal(
+			"External state anchor already exists. Refusing to mint a new book over a witness.",
 		);
 	}
 	const state: OlgaState = {
@@ -273,19 +287,19 @@ export async function initializeDisabledCandidate(
 			freezeReason: null,
 		},
 	};
-	await writeDurable(directory, MANIFEST, {
+	await writeDurable(root, MANIFEST, {
 		version: 1,
 		profile: "a1",
 		files: STATE_FILES,
 		enabled: false,
 		orders: "disabled",
 	});
-	await writeDurable(directory, OWNER, state.owner);
-	await writeDurable(directory, RISK, state.risk);
-	await writeDurable(directory, POLICY, state.policy);
-	await writeDurable(directory, BINDING, state.binding);
-	await writeDurable(directory, CLOCK, state.clock);
-	await publishAnchor(directory);
+	await writeDurable(root, OWNER, state.owner);
+	await writeDurable(root, RISK, state.risk);
+	await writeDurable(root, POLICY, state.policy);
+	await writeDurable(root, BINDING, state.binding);
+	await writeDurable(root, CLOCK, state.clock);
+	await writeInitialAnchor(root);
 	return state;
 }
 
@@ -328,24 +342,21 @@ export async function saveRisk(
 	directory: string,
 	risk: RiskRecord,
 ): Promise<void> {
-	await writeDurable(directory, RISK, parseRisk(risk));
-	await publishAnchor(directory);
+	await commitAnchored(directory, RISK, parseRisk(risk));
 }
 
 export async function saveClock(
 	directory: string,
 	clock: ClockRecord,
 ): Promise<void> {
-	await writeDurable(directory, CLOCK, parseClock(clock));
-	await publishAnchor(directory);
+	await commitAnchored(directory, CLOCK, parseClock(clock));
 }
 
 export async function saveBinding(
 	directory: string,
 	binding: BindingRecord,
 ): Promise<void> {
-	await writeDurable(directory, BINDING, parseBinding(binding));
-	await publishAnchor(directory);
+	await commitAnchored(directory, BINDING, parseBinding(binding));
 }
 
 export function reserve(risk: RiskRecord, input: ReserveInput): RiskRecord {
@@ -882,17 +893,20 @@ async function readJson(directory: string, name: string): Promise<unknown> {
 }
 
 /**
- * The anchor lives beside the state directory, not inside it. Load refuses a
- * book whose bytes or directory inode disagree with that anchor.
+ * The anchor is the sibling of the canonical state directory, never a path
+ * derived from an alias inside that directory. Load and save both require
+ * version 1 and a safe integer generation. A save may publish only the next
+ * generation of a snapshot that already matches this anchor. It does not hash
+ * whatever bytes happen to be on disk, and it does not recreate a missing or
+ * malformed witness.
  *
- * Trust boundary: a writer who can replace both the state directory and this
- * sibling anchor is the trusted operator. This build does not claim it can
- * detect that case, and it does not treat a self-consistent JSON rewrite as
- * exchange provenance. Fail closed when the anchor is missing, stale, or
- * bound to a different directory inode.
+ * Trust boundary: a writer who can replace both the canonical state directory's
+ * sibling anchor and its sibling lock can still substitute a whole book. This
+ * build does not claim to detect that operator. A writer who can edit only
+ * the state files cannot be laundered by a later clock, risk, or binding save.
  */
 export function externalAnchorPath(stateDirectory: string): string {
-	const root = resolve(stateDirectory);
+	const root = canonicalStatePath(stateDirectory);
 	const anchor = join(dirname(root), `.olga-a1.${basename(root)}.anchor.json`);
 	if (anchor === root || anchor.startsWith(`${root}${sep}`)) {
 		throw new OlgaRefusal("State anchor must sit outside the state directory.");
@@ -900,42 +914,121 @@ export function externalAnchorPath(stateDirectory: string): string {
 	return anchor;
 }
 
-async function fingerprintDirectory(directory: string): Promise<string> {
+function canonicalStatePath(stateDirectory: string): string {
+	try {
+		return realpathSync(stateDirectory);
+	} catch {
+		throw new OlgaRefusal(
+			"State directory is unavailable. Refusing an alias or a replaced path.",
+		);
+	}
+}
+
+interface TrustedAnchor {
+	version: 1;
+	generation: number;
+	fingerprint: string;
+	stateDev: string;
+	stateIno: string;
+}
+
+function fingerprintBuffers(files: ReadonlyMap<string, Buffer>): string {
 	const hash = createHash("sha256");
 	for (const name of STATE_FILES) {
+		const bytes = files.get(name);
+		if (!bytes) {
+			throw new OlgaRefusal(
+				"Olga state is partial. Refusing to replenish a missing file.",
+			);
+		}
 		hash.update(name);
 		hash.update("\0");
-		hash.update(await readFile(join(directory, name)));
+		hash.update(bytes);
 		hash.update("\0");
 	}
 	return hash.digest("hex");
 }
 
-async function publishAnchor(directory: string): Promise<void> {
-	const path = externalAnchorPath(directory);
-	const info = await stat(directory);
-	let generation = 1;
-	try {
-		const prior = JSON.parse(await readFile(path, "utf8")) as {
-			generation?: number;
-		};
-		if (
-			typeof prior.generation === "number" &&
-			Number.isInteger(prior.generation) &&
-			prior.generation >= 1
-		) {
-			generation = prior.generation + 1;
-		}
-	} catch {
-		generation = 1;
+async function readStateFiles(root: string): Promise<Map<string, Buffer>> {
+	const files = new Map<string, Buffer>();
+	for (const name of STATE_FILES) {
+		files.set(name, await readFile(join(root, name)));
 	}
-	const body = {
+	return files;
+}
+
+function parseTrustedAnchor(value: unknown): TrustedAnchor {
+	if (typeof value !== "object" || value === null) {
+		throw new OlgaRefusal("External anchor is unreadable.");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.version !== 1) {
+		throw new OlgaRefusal("External anchor version is not 1.");
+	}
+	if (
+		typeof record.generation !== "number" ||
+		!Number.isSafeInteger(record.generation) ||
+		record.generation < 1
+	) {
+		throw new OlgaRefusal(
+			"External anchor generation is not a monotonic integer.",
+		);
+	}
+	if (
+		typeof record.fingerprint !== "string" ||
+		!/^[0-9a-f]{64}$/.test(record.fingerprint)
+	) {
+		throw new OlgaRefusal("External anchor fingerprint is unreadable.");
+	}
+	if (
+		typeof record.stateDev !== "string" ||
+		record.stateDev.length === 0 ||
+		typeof record.stateIno !== "string" ||
+		record.stateIno.length === 0
+	) {
+		throw new OlgaRefusal("External anchor directory identity is unreadable.");
+	}
+	return {
 		version: 1,
-		generation,
-		fingerprint: await fingerprintDirectory(directory),
-		stateDev: String(info.dev),
-		stateIno: String(info.ino),
+		generation: record.generation,
+		fingerprint: record.fingerprint,
+		stateDev: record.stateDev,
+		stateIno: record.stateIno,
 	};
+}
+
+async function readAnchorFile(root: string): Promise<TrustedAnchor> {
+	const path = externalAnchorPath(root);
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch {
+		throw new OlgaRefusal(
+			"External state anchor is missing. Refusing a book with no independent generation.",
+		);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw) as unknown;
+	} catch {
+		throw new OlgaRefusal("External anchor is unreadable.");
+	}
+	return parseTrustedAnchor(parsed);
+}
+
+async function anchorExists(root: string): Promise<boolean> {
+	try {
+		await stat(externalAnchorPath(root));
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function writeAnchor(root: string, body: TrustedAnchor): Promise<void> {
+	const path = externalAnchorPath(root);
 	const temporary = `${path}.${process.pid}.tmp`;
 	const handle = await open(temporary, "w", 0o600);
 	try {
@@ -953,38 +1046,91 @@ async function publishAnchor(directory: string): Promise<void> {
 	}
 }
 
-async function assertAnchor(directory: string): Promise<void> {
-	const path = externalAnchorPath(directory);
-	let raw: string;
-	try {
-		raw = await readFile(path, "utf8");
-	} catch {
-		throw new OlgaRefusal(
-			"External state anchor is missing. Refusing a book with no independent generation.",
-		);
-	}
-	const anchor = JSON.parse(raw) as {
-		fingerprint?: string;
-		stateDev?: string;
-		stateIno?: string;
-		generation?: number;
-	};
-	const info = await stat(directory);
-	if (anchor.fingerprint !== (await fingerprintDirectory(directory))) {
-		throw new OlgaRefusal(
-			"State fingerprint does not match the external anchor. Refusing a rewritten or rolled-back book.",
-		);
-	}
+async function writeInitialAnchor(root: string): Promise<void> {
+	const files = await readStateFiles(root);
+	const info = await stat(root);
+	await writeAnchor(root, {
+		version: 1,
+		generation: 1,
+		fingerprint: fingerprintBuffers(files),
+		stateDev: String(info.dev),
+		stateIno: String(info.ino),
+	});
+}
+
+async function requireTrustedSnapshot(directory: string): Promise<{
+	root: string;
+	anchor: TrustedAnchor;
+	files: Map<string, Buffer>;
+}> {
+	const root = await realpath(directory);
+	const anchor = await readAnchorFile(root);
+	const info = await stat(root);
 	if (
 		anchor.stateDev !== String(info.dev) ||
-		anchor.stateIno !== String(info.ino) ||
-		typeof anchor.generation !== "number" ||
-		anchor.generation < 1
+		anchor.stateIno !== String(info.ino)
 	) {
 		throw new OlgaRefusal(
 			"State directory identity does not match the external anchor. Refusing a replaced directory.",
 		);
 	}
+	const files = await readStateFiles(root);
+	if (fingerprintBuffers(files) !== anchor.fingerprint) {
+		throw new OlgaRefusal(
+			"State fingerprint does not match the external anchor. Refusing to reanchor a rewritten or rolled-back book.",
+		);
+	}
+	return { root, anchor, files };
+}
+
+async function assertAnchor(directory: string): Promise<void> {
+	await requireTrustedSnapshot(directory);
+}
+
+async function commitAnchored(
+	directory: string,
+	name: (typeof STATE_FILES)[number],
+	value: unknown,
+): Promise<void> {
+	const prior = await requireTrustedSnapshot(directory);
+	const nextBody = Buffer.from(`${JSON.stringify(value)}\n`);
+	await writeDurable(prior.root, name, value);
+	const info = await stat(prior.root);
+	if (
+		prior.anchor.stateDev !== String(info.dev) ||
+		prior.anchor.stateIno !== String(info.ino)
+	) {
+		throw new OlgaRefusal(
+			"State directory identity does not match the external anchor. Refusing a replaced directory.",
+		);
+	}
+	const files = new Map(prior.files);
+	for (const other of STATE_FILES) {
+		const bytes = await readFile(join(prior.root, other));
+		const previous = files.get(other);
+		if (other !== name && (!previous || !bytes.equals(previous))) {
+			throw new OlgaRefusal(
+				"An unrelated state file changed during the save. Refusing to reanchor a rewritten or rolled-back book.",
+			);
+		}
+		files.set(other, bytes);
+	}
+	const written = files.get(name);
+	if (!written?.equals(nextBody)) {
+		throw new OlgaRefusal(
+			"The saved state file does not match the write. Refusing to reanchor a rewritten or rolled-back book.",
+		);
+	}
+	if (prior.anchor.generation >= Number.MAX_SAFE_INTEGER) {
+		throw new OlgaRefusal("External anchor generation cannot advance.");
+	}
+	await writeAnchor(prior.root, {
+		version: 1,
+		generation: prior.anchor.generation + 1,
+		fingerprint: fingerprintBuffers(files),
+		stateDev: prior.anchor.stateDev,
+		stateIno: prior.anchor.stateIno,
+	});
 }
 
 async function writeDurable(

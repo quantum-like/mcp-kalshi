@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { constants, statSync } from "node:fs";
-import { mkdir, open, stat } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { constants, realpathSync, statSync } from "node:fs";
+import { mkdir, open, realpath, stat } from "node:fs/promises";
+import { basename, dirname, join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export interface HostLock {
@@ -10,58 +10,98 @@ export interface HostLock {
 }
 
 /**
- * The lock directory is a sibling of the state directory, not a file inside it.
- * Replacing or renaming the state directory does not move this inode, so a
- * second process cannot acquire the same logical state. The held state
- * directory's device and inode are checked again before use.
+ * The path lock is a sibling of the canonical state directory. An alias inside
+ * the state directory resolves to that same directory, so it does not grow a
+ * private lock under the state tree. The state directory inode is locked as
+ * well: a rename of that inode cannot be acquired through the new path while
+ * the first holder is alive.
  *
- * An operator who can also replace this sibling lock directory is outside the
- * fence. This does not claim tamper resistance against that writer.
- * Linux locks the directory with flock. macOS uses O_EXLOCK. The macOS path
- * is not executed in the Linux suite.
+ * Replacing the state directory at the original path keeps the sibling path
+ * lock and fails a second acquire. The holder also fails closed when that
+ * path's inode changes. An operator who can replace the sibling lock directory
+ * is outside the fence. Linux uses flock. macOS is written to use O_EXLOCK and
+ * is not executed here.
  */
 export function hostLockDirectory(stateDirectory: string): string {
-	const root = resolve(stateDirectory);
-	return join(dirname(root), `.olga-a1.${basename(root)}.lockdir`);
-}
-
-export async function acquireHostLock(
-	stateDirectory: string,
-): Promise<HostLock> {
-	const root = resolve(stateDirectory);
-	const lockDirectory = hostLockDirectory(root);
+	const root = canonicalRoot(stateDirectory);
+	const lockDirectory = join(
+		dirname(root),
+		`.olga-a1.${basename(root)}.lockdir`,
+	);
 	if (lockDirectory === root || lockDirectory.startsWith(`${root}${sep}`)) {
 		throw new Error(
 			"Host lock must sit outside the state directory. No fallback host is allowed.",
 		);
 	}
-	await mkdir(lockDirectory, { recursive: true });
+	return lockDirectory;
+}
+
+function canonicalRoot(stateDirectory: string): string {
+	try {
+		return realpathSync(stateDirectory);
+	} catch {
+		throw new Error(
+			"State directory is unavailable. No fallback host is allowed.",
+		);
+	}
+}
+
+function flockExclusive(fd: number, useMacLock: boolean): void {
+	if (useMacLock) return;
+	const result = spawnSync("flock", ["--exclusive", "--nonblock", "3"], {
+		stdio: ["ignore", "ignore", "pipe", fd],
+	});
+	if (result.error || result.status !== 0) {
+		throw new Error(
+			result.error
+				? "Directory lock is unavailable. Refusing a replaceable state-path lock."
+				: "Olga host lock is held. No fallback host is allowed.",
+		);
+	}
+}
+
+export async function acquireHostLock(
+	stateDirectory: string,
+): Promise<HostLock> {
+	const root = await realpath(stateDirectory);
+	const lockDirectory = hostLockDirectory(root);
 	const exlock = (constants as { O_EXLOCK?: number }).O_EXLOCK;
 	const useMacLock =
 		process.platform === "darwin" && typeof exlock === "number";
-	const dirHandle = await open(
-		lockDirectory,
+	const openFlags =
 		constants.O_RDONLY |
-			constants.O_DIRECTORY |
-			(useMacLock ? exlock | constants.O_NONBLOCK : 0),
-	).catch((error: NodeJS.ErrnoException) => {
-		if (error.code === "EAGAIN" || error.code === "EWOULDBLOCK") {
-			throw new Error("Olga host lock is held. No fallback host is allowed.");
-		}
+		constants.O_DIRECTORY |
+		(useMacLock ? exlock | constants.O_NONBLOCK : 0);
+	const stateHandle = await open(root, openFlags).catch(
+		(error: NodeJS.ErrnoException) => {
+			if (error.code === "EAGAIN" || error.code === "EWOULDBLOCK") {
+				throw new Error("Olga host lock is held. No fallback host is allowed.");
+			}
+			throw error;
+		},
+	);
+	try {
+		flockExclusive(stateHandle.fd, useMacLock);
+	} catch (error) {
+		await stateHandle.close();
 		throw error;
-	});
-	if (!useMacLock) {
-		const result = spawnSync("flock", ["--exclusive", "--nonblock", "3"], {
-			stdio: ["ignore", "ignore", "pipe", dirHandle.fd],
-		});
-		if (result.error || result.status !== 0) {
-			await dirHandle.close();
-			throw new Error(
-				result.error
-					? "Directory lock is unavailable. Refusing a replaceable state-path lock."
-					: "Olga host lock is held. No fallback host is allowed.",
-			);
-		}
+	}
+	await mkdir(lockDirectory, { recursive: true });
+	const dirHandle = await open(lockDirectory, openFlags).catch(
+		async (error: NodeJS.ErrnoException) => {
+			await stateHandle.close();
+			if (error.code === "EAGAIN" || error.code === "EWOULDBLOCK") {
+				throw new Error("Olga host lock is held. No fallback host is allowed.");
+			}
+			throw error;
+		},
+	);
+	try {
+		flockExclusive(dirHandle.fd, useMacLock);
+	} catch (error) {
+		await dirHandle.close();
+		await stateHandle.close();
+		throw error;
 	}
 	const dbPath = join(lockDirectory, "host.sqlite");
 	let db: DatabaseSync | undefined;
@@ -77,11 +117,18 @@ export async function acquireHostLock(
 				"Olga lock path was replaced. No fallback host is allowed.",
 			);
 		}
+		const held = await stateHandle.stat();
 		const stateInfo = await stat(root);
-		captured = { dev: stateInfo.dev, ino: stateInfo.ino };
+		if (held.dev !== stateInfo.dev || held.ino !== stateInfo.ino) {
+			throw new Error(
+				"State directory identity changed. No fallback host is allowed.",
+			);
+		}
+		captured = { dev: held.dev, ino: held.ino };
 	} catch (error) {
 		db?.close();
 		await dirHandle.close();
+		await stateHandle.close();
 		if (
 			error instanceof Error &&
 			error.message.includes("No fallback host is allowed.")
@@ -95,8 +142,21 @@ export async function acquireHostLock(
 	let released = false;
 	return {
 		async assertBound() {
-			const now = await stat(root);
-			if (now.dev !== bound.dev || now.ino !== bound.ino) {
+			const held = await stateHandle.stat();
+			let now: { dev: number; ino: number };
+			try {
+				now = await stat(root);
+			} catch {
+				throw new Error(
+					"State directory identity changed. No fallback host is allowed.",
+				);
+			}
+			if (
+				now.dev !== bound.dev ||
+				now.ino !== bound.ino ||
+				held.dev !== bound.dev ||
+				held.ino !== bound.ino
+			) {
 				throw new Error(
 					"State directory identity changed. No fallback host is allowed.",
 				);
@@ -108,6 +168,7 @@ export async function acquireHostLock(
 			heldDb.exec("ROLLBACK");
 			heldDb.close();
 			await dirHandle.close();
+			await stateHandle.close();
 		},
 	};
 }

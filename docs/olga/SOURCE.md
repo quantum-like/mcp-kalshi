@@ -4,7 +4,7 @@ The 0.1.5 release pack reviewed in the attached assessment contains compiled `di
 
 - Repository: `https://github.com/quantum-like/mcp-kalshi`
 - Branch: `cursor/a1-readiness-5a91`
-- Safety-repair parent: `917dff61dbac00aceee9bb1cde11d71b96f739e0`
+- Safety-repair parent: `ca76b531e283348cc3c98bdde768a39fd9117934`
 - Original TypeScript pin: `e75202e92e50c62f88eee3e26b68cd7a06dffc24`
 - Pull request: `https://github.com/quantum-like/mcp-kalshi/pull/2`
 

@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cp, rename, symlink, unlink } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { acquireHostLock } from "../src/olga/lock.js";
+import { acquireHostLock, hostLockDirectory } from "../src/olga/lock.js";
 import {
+	A1_KEYCHAIN_SERVICE,
+	OLGA_HOME,
+	OLGA_MACHINE_ID,
 	applyOlgaFill,
 	externalAnchorPath,
 	initializeDisabledCandidate,
@@ -15,9 +20,12 @@ import {
 	markUnknown,
 	releaseUnsent,
 	reserve,
+	saveBinding,
+	saveClock,
 	saveRisk,
 	spendableUnits,
 } from "../src/olga/state.js";
+import { runDisabledTick } from "../src/olga/tick.js";
 
 const NOW = 1_700_000_000_000;
 
@@ -424,18 +432,7 @@ test("coherent fee rewrites, snapshot rollback, and market relabel fail closed",
 	try {
 		const bought = applyOlgaFill(reserve(risk, order("buy")), fill("buy"));
 		await saveRisk(directory, bought);
-		const before = await readFile(join(directory, "olga-risk.json"));
-		const later = releaseUnsent(reserve(risk, order("other")), "other", true);
-		await saveRisk(directory, later);
-		await writeFile(join(directory, "olga-risk.json"), before);
-		const rolled = await loadOlgaState(directory);
-		assert.equal(rolled.ok, false);
-		assert.match(
-			rolled.ok ? "" : rolled.reason,
-			/fingerprint|rolled-back|anchor/,
-		);
-
-		await saveRisk(directory, bought);
+		const trusted = await readFile(join(directory, "olga-risk.json"));
 		const book = JSON.parse(
 			await readFile(join(directory, "olga-risk.json"), "utf8"),
 		) as {
@@ -461,8 +458,7 @@ test("coherent fee rewrites, snapshot rollback, and market relabel fail closed",
 			cheaper.ok ? "" : cheaper.reason,
 			/fingerprint|rolled-back|anchor/,
 		);
-
-		await saveRisk(directory, bought);
+		await writeFile(join(directory, "olga-risk.json"), trusted);
 		const relabeled = JSON.parse(
 			await readFile(join(directory, "olga-risk.json"), "utf8"),
 		) as typeof book;
@@ -482,6 +478,16 @@ test("coherent fee rewrites, snapshot rollback, and market relabel fail closed",
 		assert.match(
 			moved.ok ? "" : moved.reason,
 			/fingerprint|anchor|rolled-back/,
+		);
+		await writeFile(join(directory, "olga-risk.json"), trusted);
+		const later = releaseUnsent(reserve(risk, order("other")), "other", true);
+		await saveRisk(directory, later);
+		await writeFile(join(directory, "olga-risk.json"), trusted);
+		const rolled = await loadOlgaState(directory);
+		assert.equal(rolled.ok, false);
+		assert.match(
+			rolled.ok ? "" : rolled.reason,
+			/fingerprint|rolled-back|anchor/,
 		);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -540,5 +546,222 @@ test("rewriting the book and the sibling anchor together is outside this fence",
 		assert.equal(forged.state.risk.realizedPnl, "-0.500000");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a clock save does not reanchor a state-only rollback or recreate a missing anchor", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const empty = await readFile(join(directory, "olga-risk.json"));
+		const state = await loadOlgaState(directory);
+		assert.equal(state.ok, true);
+		if (!state.ok) return;
+		let book = applyOlgaFill(reserve(risk, order("buy")), fill("buy"));
+		book = applyOlgaFill(
+			reserve(book, order("sell", "sell")),
+			fill("sell", "sell"),
+		);
+		await saveRisk(directory, book);
+		assert.equal(spendableUnits(book), 4_960000n);
+		const anchor = await readFile(externalAnchorPath(directory));
+		await writeFile(join(directory, "olga-risk.json"), empty);
+		assert.equal((await loadOlgaState(directory)).ok, false);
+		await assert.rejects(
+			saveClock(directory, {
+				...state.state.clock,
+				lastClockMs: NOW + 1,
+			}),
+			/fingerprint|rolled-back|anchor/,
+		);
+		const rolled = await loadOlgaState(directory);
+		assert.equal(rolled.ok, false);
+		assert.equal(
+			Buffer.compare(await readFile(externalAnchorPath(directory)), anchor),
+			0,
+		);
+		await unlink(externalAnchorPath(directory));
+		await assert.rejects(
+			saveClock(directory, state.state.clock),
+			/missing|anchor/,
+		);
+		assert.equal((await loadOlgaState(directory)).ok, false);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a fractional generation or unsupported anchor version fails closed", async () => {
+	const { directory } = await freshRisk();
+	try {
+		const path = externalAnchorPath(directory);
+		const anchor = JSON.parse(await readFile(path, "utf8")) as {
+			fingerprint: string;
+			stateDev: string;
+			stateIno: string;
+		};
+		await writeFile(
+			path,
+			`${JSON.stringify({
+				...anchor,
+				version: 99,
+				generation: 1.5,
+			})}\n`,
+		);
+		const loaded = await loadOlgaState(directory);
+		assert.equal(loaded.ok, false);
+		assert.match(
+			loaded.ok ? "" : loaded.reason,
+			/version|generation|monotonic/,
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("an alias or a renamed inode cannot take a second lock", async () => {
+	const { directory } = await freshRisk();
+	const parent = join(directory, "..");
+	const base = directory.split("/").at(-1) ?? "state";
+	const moved = join(parent, `${base}-moved`);
+	const alias = join(directory, "alias");
+	try {
+		await symlink(".", alias);
+		assert.equal(externalAnchorPath(alias), externalAnchorPath(directory));
+		assert.equal(hostLockDirectory(alias), hostLockDirectory(directory));
+		assert.equal((await loadOlgaState(alias)).ok, true);
+		const planted = join(directory, ".olga-a1.alias.anchor.json");
+		await writeFile(planted, '{"version":99,"generation":1.5}\n');
+		assert.equal((await loadOlgaState(alias)).ok, true);
+		const first = await acquireHostLock(directory);
+		try {
+			await assert.rejects(acquireHostLock(alias), /No fallback host/);
+		} finally {
+			await first.release();
+		}
+		const held = await acquireHostLock(directory);
+		try {
+			await rename(directory, moved);
+			await assert.rejects(acquireHostLock(moved), /No fallback host/);
+		} finally {
+			await held.release();
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true }).catch(
+			() => undefined,
+		);
+		await rm(moved, { recursive: true, force: true }).catch(() => undefined);
+		await rm(join(parent, `.olga-a1.${base}.lockdir`), {
+			recursive: true,
+			force: true,
+		}).catch(() => undefined);
+		await rm(join(parent, `.olga-a1.${base}-moved.lockdir`), {
+			recursive: true,
+			force: true,
+		}).catch(() => undefined);
+	}
+});
+
+test("an ordinary disabled tick does not reanchor a rollback or a swapped directory", async () => {
+	for (const attack of ["risk-rollback", "directory-replacement"] as const) {
+		const parent = await mkdtemp(join(tmpdir(), "olga-window-"));
+		const directory = join(parent, "state");
+		const moved = join(parent, "moved");
+		await fs.promises.mkdir(directory);
+		const state = await initializeDisabledCandidate(directory, NOW);
+		const empty = await readFile(join(directory, "olga-risk.json"));
+		let book = applyOlgaFill(reserve(state.risk, order("buy")), fill("buy"));
+		book = applyOlgaFill(
+			reserve(book, order("sell", "sell")),
+			fill("sell", "sell"),
+		);
+		await saveRisk(directory, book);
+		assert.equal(spendableUnits(book), 4_960000n);
+		await saveBinding(directory, {
+			...state.binding,
+			bound: true,
+			apiKeyId: "synthetic-api-id",
+			memberId: "synthetic-member",
+			subaccount: 0,
+			distinctFromMemberId: "synthetic-other",
+		});
+		const observed = {
+			keyPresent: true,
+			keychainService: A1_KEYCHAIN_SERVICE,
+			readsComplete: true,
+			apiKeyId: "synthetic-api-id",
+			memberId: "synthetic-member",
+			subaccount: 0,
+		};
+		const originalRead = fs.readFileSync;
+		const originalUser = os.userInfo;
+		let mutate = false;
+		let attacked = false;
+		fs.readFileSync = function (path, ...args) {
+			if (path === "/etc/machine-id") {
+				if (mutate && !attacked) {
+					attacked = true;
+					if (attack === "risk-rollback") {
+						fs.writeFileSync(join(directory, "olga-risk.json"), empty);
+					} else {
+						fs.renameSync(directory, moved);
+						fs.cpSync(moved, directory, { recursive: true });
+					}
+				}
+				return state.owner.machineId;
+			}
+			return originalRead.call(this, path, ...args);
+		} as typeof fs.readFileSync;
+		os.userInfo = () =>
+			({
+				username: "synthetic",
+				uid: 1000,
+				gid: 1000,
+				shell: "/bin/false",
+				homedir: OLGA_HOME,
+			}) as ReturnType<typeof os.userInfo>;
+		syncBuiltinESMExports();
+		try {
+			const control = await runDisabledTick({
+				directory,
+				nowMs: NOW + 100,
+				feedAtMs: NOW + 100,
+				exchangeNowMs: NOW + 100,
+				observed,
+			});
+			assert.equal(control.action, "WAIT");
+			assert.equal(control.submits, 0);
+			const before = await readFile(externalAnchorPath(directory));
+			mutate = true;
+			const result = await runDisabledTick({
+				directory,
+				nowMs: NOW + 200,
+				feedAtMs: NOW + 200,
+				exchangeNowMs: NOW + 200,
+				observed,
+			});
+			assert.equal(result.submits, 0);
+			assert.equal(result.retries, 0);
+			const loaded = await loadOlgaState(directory);
+			assert.equal(loaded.ok, false);
+			assert.equal(
+				Buffer.compare(await readFile(externalAnchorPath(directory)), before),
+				0,
+			);
+			if (attack === "directory-replacement") {
+				const witness = JSON.parse(
+					await readFile(externalAnchorPath(directory), "utf8"),
+				) as { stateIno: string };
+				const replacement = await stat(directory);
+				const original = await stat(moved);
+				assert.equal(witness.stateIno, String(original.ino));
+				assert.notEqual(witness.stateIno, String(replacement.ino));
+				assert.equal((await loadOlgaState(moved)).ok, false);
+			}
+		} finally {
+			fs.readFileSync = originalRead;
+			os.userInfo = originalUser;
+			syncBuiltinESMExports();
+			await rm(parent, { recursive: true, force: true });
+		}
 	}
 });

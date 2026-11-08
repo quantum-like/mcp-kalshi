@@ -1,5 +1,20 @@
 # @iqai/mcp-kalshi
 
+## 0.1.12
+
+### Patch Changes
+
+- A clock, risk, or binding save publishes the next anchor generation only
+  when the files and directory inode already match the current witness. It
+  does not hash a rolled-back book, adopt a directory that was swapped in,
+  or recreate a missing or malformed anchor. Generation must be a safe
+  integer and the anchor version must be 1.
+- The host lock follows the canonical directory. A symlink alias does not
+  receive its own lock or anchor inside the state tree. The directory inode
+  is locked as well, so renaming that inode does not admit a second holder.
+  See `docs/olga/TRUST.md`. Orders stay disabled. This is not macOS
+  acceptance.
+
 ## 0.1.11
 
 ### Patch Changes

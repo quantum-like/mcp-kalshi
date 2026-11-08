@@ -88,7 +88,24 @@ export async function runDisabledTick(input: {
 			input.nowMs,
 			input.exchangeNowMs,
 		);
-		if (nextClock) await saveClock(input.directory, nextClock);
+		if (nextClock) {
+			try {
+				await lock.assertBound();
+				await saveClock(input.directory, nextClock);
+			} catch (error) {
+				return {
+					action: "STOP",
+					reasons: [
+						error instanceof Error
+							? error.message
+							: "State changed before it could be saved. No fallback.",
+					],
+					submits: 0,
+					retries: 0,
+					freezeClock: false,
+				};
+			}
+		}
 		return decision;
 	} finally {
 		await lock.release();
