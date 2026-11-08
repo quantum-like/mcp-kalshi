@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { type OlgaDecision, clockAfterDecision, decideOlga } from "./decide.js";
 import type { ObservedIdentity } from "./decide.js";
 import { readHostIdentity } from "./host-identity.js";
@@ -34,7 +33,24 @@ export async function runDisabledTick(input: {
 			freezeClock: false,
 		};
 	}
-	const lock = await acquireHostLock(join(input.directory, "olga-host.sqlite"));
+	let lock: Awaited<ReturnType<typeof acquireHostLock>> | undefined;
+	try {
+		lock = await acquireHostLock(input.directory);
+		await lock.assertBound();
+	} catch (error) {
+		await lock?.release();
+		return {
+			action: "STOP",
+			reasons: [
+				error instanceof Error
+					? error.message
+					: "Host lock failed. No fallback host is allowed.",
+			],
+			submits: 0,
+			retries: 0,
+			freezeClock: false,
+		};
+	}
 	try {
 		const again = await loadOlgaState(input.directory);
 		if (!again.ok) {

@@ -139,6 +139,7 @@ test("external capital stays 5 while realized profit is reusable and losses dedu
 			fillId: "cycle-buy-fill",
 			clientOrderId: "cycle-buy",
 			ticker: "KXBTC15M-FAKE",
+			outcomeSide: "yes" as const,
 			action: "buy",
 			count: "1.00",
 			price: "0.500000",
@@ -155,6 +156,7 @@ test("external capital stays 5 while realized profit is reusable and losses dedu
 			fillId: "cycle-sell-fill",
 			clientOrderId: "cycle-sell",
 			ticker: "KXBTC15M-FAKE",
+			outcomeSide: "yes" as const,
 			action: "sell",
 			count: "1.00",
 			price: "0.800000",
@@ -290,7 +292,7 @@ test("an unknown order outcome is not retried or released", async () => {
 		);
 		assert.throws(
 			() => releaseUnsent(after.state.risk, "unknown-1", true),
-			/Unknown order outcome stays reserved/,
+			/Unknown order outcome stays reserved|never sent|In-flight/,
 		);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -328,7 +330,7 @@ test("an orphan submitting order stops and is not released by the tick", async (
 
 test("a killed holder releases the kernel lock and a foreign host is not adopted", async () => {
 	const directory = await freshDir();
-	const lockPath = join(directory, "olga-host.lock");
+	const lockPath = directory;
 	const compiled = resolve("dist/olga/lock.js");
 	const wrapper = join(directory, "hold.mjs");
 	const command = existsSync(compiled)
@@ -477,25 +479,12 @@ test("unknown and unvalidated policy waits and live learning is refused", async 
 		};
 		policy.policyId = "forged-adaptive";
 		for (const gate of Object.keys(policy.gates)) policy.gates[gate] = true;
-		await writeFile(
-			join(directory, "olga-policy.json"),
-			JSON.stringify(policy),
-		);
-		const forgedState = await loadOlgaState(directory);
-		assert.equal(forgedState.ok, true);
-		if (!forgedState.ok) return;
-		const forged = decideOlga(forgedState.state, input);
-		assert.equal(forged.action, "WAIT");
-		assert.match(forged.reasons[0] ?? "", /unknown or unvalidated/i);
-		const loaded = await loadOlgaState(directory);
-		assert.equal(loaded.ok, true);
-		if (!loaded.ok) return;
-		const inMemory = decideOlga(
+		const forged = decideOlga(
 			{
-				...loaded.state,
+				...loadedForPolicy.state,
 				policy: {
-					...loaded.state.policy,
-					policyId: "still-unknown",
+					...loadedForPolicy.state.policy,
+					policyId: "forged-adaptive",
 					gates: {
 						fit: true,
 						prereg: true,
@@ -509,13 +498,29 @@ test("unknown and unvalidated policy waits and live learning is refused", async 
 			},
 			input,
 		);
-		assert.equal(inMemory.action, "WAIT");
-		policy.liveLearning = true;
+		assert.equal(forged.action, "WAIT");
+		assert.match(forged.reasons[0] ?? "", /unknown or unvalidated/i);
 		await writeFile(
 			join(directory, "olga-policy.json"),
 			JSON.stringify(policy),
 		);
-		const learning = await runDisabledTick(tick(directory));
+		const rewritten = await loadOlgaState(directory);
+		assert.equal(rewritten.ok, false);
+		assert.match(
+			rewritten.ok ? "" : rewritten.reason,
+			/anchor|fingerprint|rolled-back/,
+		);
+		policy.liveLearning = true;
+		const learning = decideOlga(
+			{
+				...loadedForPolicy.state,
+				policy: {
+					...loadedForPolicy.state.policy,
+					liveLearning: true,
+				},
+			},
+			input,
+		);
 		assert.equal(learning.action, "STOP");
 		assert.match(learning.reasons[0] ?? "", /Live learning|adaptation/);
 	} finally {

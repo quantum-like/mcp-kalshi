@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,11 +8,14 @@ import { test } from "node:test";
 import { acquireHostLock } from "../src/olga/lock.js";
 import {
 	applyOlgaFill,
+	externalAnchorPath,
 	initializeDisabledCandidate,
 	loadOlgaState,
 	markSubmitting,
+	markUnknown,
 	releaseUnsent,
 	reserve,
+	saveRisk,
 	spendableUnits,
 } from "../src/olga/state.js";
 
@@ -45,6 +49,7 @@ function fill(
 		fillId: `fill-${id}`,
 		clientOrderId: id,
 		ticker: "KXBTC15M-FAKE",
+		outcomeSide: "yes" as const,
 		action,
 		count: "1.00",
 		price: "0.500000",
@@ -274,11 +279,19 @@ test("unsent release cancels the resting hold and tampered exits or duplicate id
 	const { directory, risk } = await freshRisk();
 	try {
 		const reserved = reserve(risk, order("buy"));
-		const submitting = markSubmitting(reserved, "buy");
-		const released = releaseUnsent(submitting, "buy", true);
-		assert.equal(released.reservations[0]?.state, "released");
-		assert.equal(released.allocated, "0.000000");
-		assert.equal(spendableUnits(released), 5_000000n);
+		const unsent = releaseUnsent(reserved, "buy", true);
+		assert.equal(unsent.reservations[0]?.state, "released");
+		assert.equal(unsent.allocated, "0.000000");
+		assert.equal(spendableUnits(unsent), 5_000000n);
+		const submitting = markSubmitting(
+			reserve(risk, order("inflight")),
+			"inflight",
+		);
+		assert.throws(
+			() => releaseUnsent(submitting, "inflight", true),
+			/In-flight|never sent/,
+		);
+		assert.equal(submitting.allocated, "0.555000");
 		const bought = applyOlgaFill(reserve(risk, order("held")), fill("held"));
 		const erased = structuredClone(bought);
 		erased.reservations[0].exitReleased = "1.00";
@@ -316,15 +329,216 @@ test("unsent release cancels the resting hold and tampered exits or duplicate id
 	}
 });
 
-test("replacing the lock file path does not admit a second holder", async () => {
+test("replacing the state directory does not admit a second holder", async () => {
 	const { directory } = await freshRisk();
-	const lockPath = join(directory, "olga-host.sqlite");
-	const first = await acquireHostLock(lockPath);
+	const first = await acquireHostLock(directory);
+	const parent = join(directory, "..");
+	const base = directory.split("/").at(-1) ?? "state";
+	const moved = join(parent, `${base}-moved`);
 	try {
-		await unlink(lockPath);
-		await assert.rejects(acquireHostLock(lockPath), /No fallback host/);
+		const { rename, cp } = await import("node:fs/promises");
+		await rename(directory, moved);
+		await cp(moved, directory, { recursive: true });
+		await assert.rejects(acquireHostLock(directory), /No fallback host/);
+		await assert.rejects(first.assertBound(), /identity changed/);
 	} finally {
 		await first.release();
+		await rm(directory, { recursive: true, force: true });
+		await rm(moved, { recursive: true, force: true }).catch(() => undefined);
+		await rm(join(parent, `.olga-a1.${base}.lockdir`), {
+			recursive: true,
+			force: true,
+		}).catch(() => undefined);
+	}
+});
+
+test("a contradictory fill outcome is rejected and a coherent rewrite without the anchor is refused", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const reserved = reserve(risk, order("buy"));
+		assert.throws(
+			() =>
+				applyOlgaFill(reserved, {
+					...fill("buy"),
+					outcomeSide: "no",
+				}),
+			/outcome/i,
+		);
+		const bought = applyOlgaFill(reserved, fill("buy"));
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(bought));
+		const rewritten = await loadOlgaState(directory);
+		assert.equal(rewritten.ok, false);
+		assert.match(
+			rewritten.ok ? "" : rewritten.reason,
+			/anchor|fingerprint|rolled-back/,
+		);
+		const { outcomeSide: _outcomeSide, ...missing } = fill("buy");
+		assert.throws(
+			() => applyOlgaFill(reserved, missing as ReturnType<typeof fill>),
+			/outcome/i,
+		);
+		assert.equal(_outcomeSide, "yes");
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("in-flight and partial commitments stay reserved without cancellation proof", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const held = reserve(risk, order("never"));
+		const freed = releaseUnsent(held, "never", true);
+		assert.equal(freed.reservations[0]?.state, "released");
+		assert.equal(freed.allocated, "0.000000");
+		const submitting = markSubmitting(reserve(risk, order("sent")), "sent");
+		assert.equal(submitting.reservations[0]?.dispatch, "started");
+		assert.throws(
+			() => releaseUnsent(submitting, "sent", true),
+			/never sent|In-flight/,
+		);
+		assert.equal(submitting.allocated, "0.555000");
+		const partial = applyOlgaFill(
+			reserve(risk, order("part")),
+			fill("part", "buy", { count: "0.50", fee: "0.010000" }),
+		);
+		assert.equal(partial.reservations[0]?.dispatch, "started");
+		assert.notEqual(partial.allocated, "0.000000");
+		assert.throws(
+			() => releaseUnsent(partial, "part", true),
+			/never sent|not unsent|In-flight/,
+		);
+		assert.notEqual(partial.allocated, "0.000000");
+		const unknown = markUnknown(reserve(risk, order("unknown")), "unknown");
+		assert.throws(
+			() => releaseUnsent(unknown, "unknown", false),
+			/never sent|In-flight|unknown|Incomplete read/i,
+		);
+		assert.equal(unknown.reservations[0]?.state, "unknown");
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("coherent fee rewrites, snapshot rollback, and market relabel fail closed", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const bought = applyOlgaFill(reserve(risk, order("buy")), fill("buy"));
+		await saveRisk(directory, bought);
+		const before = await readFile(join(directory, "olga-risk.json"));
+		const later = releaseUnsent(reserve(risk, order("other")), "other", true);
+		await saveRisk(directory, later);
+		await writeFile(join(directory, "olga-risk.json"), before);
+		const rolled = await loadOlgaState(directory);
+		assert.equal(rolled.ok, false);
+		assert.match(
+			rolled.ok ? "" : rolled.reason,
+			/fingerprint|rolled-back|anchor/,
+		);
+
+		await saveRisk(directory, bought);
+		const book = JSON.parse(
+			await readFile(join(directory, "olga-risk.json"), "utf8"),
+		) as {
+			realizedPnl: string;
+			reservations: Array<{ ticker: string; side: string }>;
+			appliedFills: Array<{
+				ticker: string;
+				outcomeSide: string;
+				fee: string;
+				cashDelta: string;
+			}>;
+		};
+		const row = book.reservations[0];
+		const applied = book.appliedFills[0];
+		assert.ok(row && applied);
+		applied.fee = "0.000000";
+		applied.cashDelta = "-0.500000";
+		book.realizedPnl = "-0.500000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(book));
+		const cheaper = await loadOlgaState(directory);
+		assert.equal(cheaper.ok, false);
+		assert.match(
+			cheaper.ok ? "" : cheaper.reason,
+			/fingerprint|rolled-back|anchor/,
+		);
+
+		await saveRisk(directory, bought);
+		const relabeled = JSON.parse(
+			await readFile(join(directory, "olga-risk.json"), "utf8"),
+		) as typeof book;
+		const reservation = relabeled.reservations[0];
+		const fillRow = relabeled.appliedFills[0];
+		assert.ok(reservation && fillRow);
+		reservation.ticker = "KXETH15M-FAKE";
+		reservation.side = "no";
+		fillRow.ticker = "KXETH15M-FAKE";
+		fillRow.outcomeSide = "no";
+		await writeFile(
+			join(directory, "olga-risk.json"),
+			JSON.stringify(relabeled),
+		);
+		const moved = await loadOlgaState(directory);
+		assert.equal(moved.ok, false);
+		assert.match(
+			moved.ok ? "" : moved.reason,
+			/fingerprint|anchor|rolled-back/,
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("rewriting the book and the sibling anchor together is outside this fence", async () => {
+	const { directory, risk } = await freshRisk();
+	try {
+		const bought = applyOlgaFill(reserve(risk, order("buy")), fill("buy"));
+		await saveRisk(directory, bought);
+		const names = [
+			"olga-manifest.json",
+			"olga-owner.json",
+			"olga-risk.json",
+			"olga-policy.json",
+			"olga-binding.json",
+			"olga-clock.json",
+		];
+		const book = JSON.parse(
+			await readFile(join(directory, "olga-risk.json"), "utf8"),
+		) as {
+			realizedPnl: string;
+			appliedFills: Array<{ fee: string; cashDelta: string }>;
+		};
+		const applied = book.appliedFills[0];
+		assert.ok(applied);
+		applied.fee = "0.000000";
+		applied.cashDelta = "-0.500000";
+		book.realizedPnl = "-0.500000";
+		await writeFile(join(directory, "olga-risk.json"), JSON.stringify(book));
+		const hash = createHash("sha256");
+		for (const name of names) {
+			hash.update(name);
+			hash.update("\0");
+			hash.update(await readFile(join(directory, name)));
+			hash.update("\0");
+		}
+		const info = await stat(directory);
+		const prior = JSON.parse(
+			await readFile(externalAnchorPath(directory), "utf8"),
+		) as { generation: number };
+		await writeFile(
+			externalAnchorPath(directory),
+			`${JSON.stringify({
+				version: 1,
+				generation: prior.generation + 1,
+				fingerprint: hash.digest("hex"),
+				stateDev: String(info.dev),
+				stateIno: String(info.ino),
+			})}\n`,
+		);
+		const forged = await loadOlgaState(directory);
+		assert.equal(forged.ok, true);
+		if (!forged.ok) return;
+		assert.equal(forged.state.risk.realizedPnl, "-0.500000");
+	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });

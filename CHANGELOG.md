@@ -1,5 +1,20 @@
 # @iqai/mcp-kalshi
 
+## 0.1.11
+
+### Patch Changes
+
+- The host lock is a sibling directory outside the state path, so replacing
+  that directory does not admit a second holder. The holder fails closed
+  when the state inode changes. `releaseUnsent` frees a hold only when the
+  reservation was never dispatched. Submitting, partial, and unknown
+  commitments stay reserved. A fill must name the reserved YES/NO outcome.
+  Load checks an external fingerprint and directory inode, and refuses a
+  coherent fee rewrite, a snapshot rollback, or a market relabel that does
+  not match that anchor. Rewriting the anchor as well is outside the claim.
+  See `docs/olga/TRUST.md`. Orders stay disabled. This is not macOS
+  acceptance.
+
 ## 0.1.10
 
 ### Patch Changes

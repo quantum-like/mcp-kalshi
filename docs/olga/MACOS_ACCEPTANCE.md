@@ -9,6 +9,6 @@ Blocked until a later, separate approval:
 - The disabled plist remains unloaded. Nobody runs `launchctl bootstrap` or `launchctl load` as part of acceptance.
 - A separate a1 key is created in Kalshi's settings and imported into the Olga Keychain service `mcp-kalshi-a1`. This repository does not do that import.
 - An approved read-only process on Olga checks member id, key id, and subaccount against the binding and checks that positions, orders, fills, settlements, and cash are complete. Unknown still fail closed.
-- The host lock is Node's built-in SQLite exclusive lock. This Linux run does not accept that path on Olga.
+- The host lock is a sibling directory outside the state path, with SQLite `BEGIN EXCLUSIVE` inside that directory. macOS `O_EXLOCK` on that directory is not executed here. See `docs/olga/TRUST.md`. This Linux run does not accept that path on Olga.
 
 Until those are done, the candidate stays disabled. A passing Linux suite does not authorize a schedule, an order, or a cutover.

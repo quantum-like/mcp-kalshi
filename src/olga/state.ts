@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { open, readFile, readdir, rename } from "node:fs/promises";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { open, readFile, readdir, rename, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
 	formatCount,
 	formatMoney,
@@ -74,6 +74,8 @@ export interface Reservation {
 	reservedExitFee: string;
 	amount: string;
 	state: ReservationState;
+	/** never: no transport has started. started: a request may have left the process. */
+	dispatch: "never" | "started";
 }
 
 export interface ReserveInput {
@@ -107,6 +109,7 @@ export interface RiskRecord {
 		fillId: string;
 		clientOrderId: string;
 		ticker: string;
+		outcomeSide: "yes" | "no";
 		action: "buy" | "sell";
 		count: string;
 		price: string;
@@ -282,6 +285,7 @@ export async function initializeDisabledCandidate(
 	await writeDurable(directory, POLICY, state.policy);
 	await writeDurable(directory, BINDING, state.binding);
 	await writeDurable(directory, CLOCK, state.clock);
+	await publishAnchor(directory);
 	return state;
 }
 
@@ -310,6 +314,7 @@ export async function loadOlgaState(
 			binding: parseBinding(await readJson(directory, BINDING)),
 			clock: parseClock(await readJson(directory, CLOCK)),
 		};
+		await assertAnchor(directory);
 		return { ok: true, state };
 	} catch (error) {
 		return {
@@ -324,6 +329,7 @@ export async function saveRisk(
 	risk: RiskRecord,
 ): Promise<void> {
 	await writeDurable(directory, RISK, parseRisk(risk));
+	await publishAnchor(directory);
 }
 
 export async function saveClock(
@@ -331,6 +337,7 @@ export async function saveClock(
 	clock: ClockRecord,
 ): Promise<void> {
 	await writeDurable(directory, CLOCK, parseClock(clock));
+	await publishAnchor(directory);
 }
 
 export async function saveBinding(
@@ -338,6 +345,7 @@ export async function saveBinding(
 	binding: BindingRecord,
 ): Promise<void> {
 	await writeDurable(directory, BINDING, parseBinding(binding));
+	await publishAnchor(directory);
 }
 
 export function reserve(risk: RiskRecord, input: ReserveInput): RiskRecord {
@@ -388,6 +396,7 @@ export function applyOlgaFill(
 		fillId: string;
 		clientOrderId: string;
 		ticker: string;
+		outcomeSide: "yes" | "no";
 		action: "buy" | "sell";
 		count: string;
 		price: string;
@@ -434,7 +443,7 @@ export function markUnknown(
 		if (reservation.state === "released") {
 			throw new OlgaRefusal("A released reservation cannot become unknown.");
 		}
-		return { ...reservation, state: "unknown" };
+		return { ...reservation, state: "unknown", dispatch: "started" };
 	});
 }
 
@@ -448,7 +457,7 @@ export function markSubmitting(
 				"Only a held reservation can be marked submitting, and it is not retried.",
 			);
 		}
-		return { ...reservation, state: "submitting" };
+		return { ...reservation, state: "submitting", dispatch: "started" };
 	});
 }
 
@@ -584,11 +593,18 @@ function parseAppliedFill(value: unknown): RiskRecord["appliedFills"][number] {
 	if (record.action !== "buy" && record.action !== "sell") {
 		throw new OlgaRefusal("Applied fill action is unreadable.");
 	}
+	if (record.outcomeSide !== "yes" && record.outcomeSide !== "no") {
+		throw new OlgaRefusal(
+			"Fill outcome is missing or contradictory. Refusing to guess the side.",
+		);
+	}
 	const action: "buy" | "sell" = record.action;
+	const outcomeSide: "yes" | "no" = record.outcomeSide;
 	const fill = {
 		fillId: text("fillId"),
 		clientOrderId: text("clientOrderId"),
 		ticker: text("ticker"),
+		outcomeSide,
 		action,
 		count: text("count"),
 		price: text("price"),
@@ -628,6 +644,7 @@ function parseReservation(value: unknown): Reservation {
 		"reservedExitFee",
 		"amount",
 		"state",
+		"dispatch",
 	]);
 	const text = (key: string) => {
 		const field = record[key];
@@ -679,6 +696,14 @@ function parseReservation(value: unknown): Reservation {
 		reservedExitFee: text("reservedExitFee"),
 		amount: text("amount"),
 		state: record.state,
+		dispatch:
+			record.dispatch === "never" || record.dispatch === "started"
+				? record.dispatch
+				: (() => {
+						throw new OlgaRefusal(
+							"Dispatch state is missing. Refusing to treat an order as never sent.",
+						);
+					})(),
 	};
 }
 
@@ -854,6 +879,112 @@ async function existingStateFiles(directory: string): Promise<string[]> {
 async function readJson(directory: string, name: string): Promise<unknown> {
 	const raw = await readFile(join(directory, name), "utf8");
 	return JSON.parse(raw) as unknown;
+}
+
+/**
+ * The anchor lives beside the state directory, not inside it. Load refuses a
+ * book whose bytes or directory inode disagree with that anchor.
+ *
+ * Trust boundary: a writer who can replace both the state directory and this
+ * sibling anchor is the trusted operator. This build does not claim it can
+ * detect that case, and it does not treat a self-consistent JSON rewrite as
+ * exchange provenance. Fail closed when the anchor is missing, stale, or
+ * bound to a different directory inode.
+ */
+export function externalAnchorPath(stateDirectory: string): string {
+	const root = resolve(stateDirectory);
+	const anchor = join(dirname(root), `.olga-a1.${basename(root)}.anchor.json`);
+	if (anchor === root || anchor.startsWith(`${root}${sep}`)) {
+		throw new OlgaRefusal("State anchor must sit outside the state directory.");
+	}
+	return anchor;
+}
+
+async function fingerprintDirectory(directory: string): Promise<string> {
+	const hash = createHash("sha256");
+	for (const name of STATE_FILES) {
+		hash.update(name);
+		hash.update("\0");
+		hash.update(await readFile(join(directory, name)));
+		hash.update("\0");
+	}
+	return hash.digest("hex");
+}
+
+async function publishAnchor(directory: string): Promise<void> {
+	const path = externalAnchorPath(directory);
+	const info = await stat(directory);
+	let generation = 1;
+	try {
+		const prior = JSON.parse(await readFile(path, "utf8")) as {
+			generation?: number;
+		};
+		if (
+			typeof prior.generation === "number" &&
+			Number.isInteger(prior.generation) &&
+			prior.generation >= 1
+		) {
+			generation = prior.generation + 1;
+		}
+	} catch {
+		generation = 1;
+	}
+	const body = {
+		version: 1,
+		generation,
+		fingerprint: await fingerprintDirectory(directory),
+		stateDev: String(info.dev),
+		stateIno: String(info.ino),
+	};
+	const temporary = `${path}.${process.pid}.tmp`;
+	const handle = await open(temporary, "w", 0o600);
+	try {
+		await handle.writeFile(`${JSON.stringify(body)}\n`);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await rename(temporary, path);
+	const parent = await open(dirname(path), "r");
+	try {
+		await parent.sync();
+	} finally {
+		await parent.close();
+	}
+}
+
+async function assertAnchor(directory: string): Promise<void> {
+	const path = externalAnchorPath(directory);
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch {
+		throw new OlgaRefusal(
+			"External state anchor is missing. Refusing a book with no independent generation.",
+		);
+	}
+	const anchor = JSON.parse(raw) as {
+		fingerprint?: string;
+		stateDev?: string;
+		stateIno?: string;
+		generation?: number;
+	};
+	const info = await stat(directory);
+	if (anchor.fingerprint !== (await fingerprintDirectory(directory))) {
+		throw new OlgaRefusal(
+			"State fingerprint does not match the external anchor. Refusing a rewritten or rolled-back book.",
+		);
+	}
+	if (
+		anchor.stateDev !== String(info.dev) ||
+		anchor.stateIno !== String(info.ino) ||
+		typeof anchor.generation !== "number" ||
+		anchor.generation < 1
+	) {
+		throw new OlgaRefusal(
+			"State directory identity does not match the external anchor. Refusing a replaced directory.",
+		);
+	}
 }
 
 async function writeDurable(

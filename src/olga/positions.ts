@@ -15,6 +15,7 @@ export interface OlgaFill {
 	fillId: string;
 	clientOrderId: string;
 	ticker: string;
+	outcomeSide: "yes" | "no";
 	action: "buy" | "sell";
 	count: string;
 	price: string;
@@ -177,6 +178,24 @@ export function auditReservations(reservations: Reservation[]): void {
 	const sellUsed = new Map<string, bigint>();
 	for (const reservation of reservations) {
 		requireTicker(reservation.ticker);
+		if (
+			reservation.dispatch !== "never" &&
+			reservation.dispatch !== "started"
+		) {
+			throw new OlgaRefusal(
+				"Dispatch state is missing. Refusing to treat an order as never sent.",
+			);
+		}
+		if (
+			reservation.dispatch === "never" &&
+			(reservation.state === "submitting" ||
+				reservation.state === "unknown" ||
+				nonNegativeCount(reservation.filled) !== 0n)
+		) {
+			throw new OlgaRefusal(
+				"A never-sent flag contradicts fills or an in-flight state.",
+			);
+		}
 		if (ids.has(reservation.id) || clientIds.has(reservation.clientOrderId)) {
 			throw new OlgaRefusal(
 				"Duplicate reservation identity. One order cannot be represented twice.",
@@ -261,29 +280,31 @@ export function auditReservations(reservations: Reservation[]): void {
 }
 
 export function cancelUnsentReservation(reservation: Reservation): Reservation {
-	if (reservation.state === "unknown") {
+	if (reservation.dispatch !== "never" || reservation.state !== "held") {
 		throw new OlgaRefusal(
-			"Unknown order outcome stays reserved. Refusing to release or retry it.",
+			"In-flight, partial, and unknown commitments stay reserved until terminal evidence. A boolean is not proof the order was never sent.",
 		);
 	}
-	if (reservation.state !== "submitting") {
+	if (
+		nonNegativeCount(reservation.filled) !== 0n ||
+		nonNegativeCount(reservation.exitReleased) !== 0n
+	) {
 		throw new OlgaRefusal(
-			"Only an unsent submitting reservation can be released.",
+			"A reservation with fills is not unsent. The commitment stays reserved.",
 		);
 	}
 	const next: Reservation = {
 		...reservation,
-		cancelled: formatCount(
-			nonNegativeCount(reservation.cancelled) + restingCount(reservation),
-		),
+		cancelled: formatCount(positiveCount(reservation.count)),
 	};
 	if (next.action === "buy") syncBuy(next);
 	else syncSell(next);
-	if (next.amount === "0.000000" && next.reservedExitFee === "0.000000") {
-		next.state = "released";
-	} else {
-		next.state = "held";
+	if (next.amount !== "0.000000" || next.reservedExitFee !== "0.000000") {
+		throw new OlgaRefusal(
+			"Unsent release could not clear the hold. Refusing to free it.",
+		);
 	}
+	next.state = "released";
 	return next;
 }
 
@@ -302,6 +323,7 @@ export function createReservation(
 			ticker: requireTicker(input.ticker),
 			side: input.side,
 			action: "buy",
+			dispatch: "never",
 			count,
 			filled: "0.00",
 			cancelled: "0.00",
@@ -329,6 +351,7 @@ export function createReservation(
 		ticker: requireTicker(input.ticker),
 		side: input.side,
 		action: "sell",
+		dispatch: "never",
 		count,
 		filled: "0.00",
 		cancelled: "0.00",
@@ -433,6 +456,9 @@ export function assertFillLedger(
 			throw new OlgaRefusal(
 				"Fill does not match the reserved market. Another instrument cannot book this order.",
 			);
+		}
+		if (fill.outcomeSide !== reservation.side) {
+			throw new OlgaRefusal("Fill outcome does not match the reserved side.");
 		}
 		const price = tradePrice(fill.price);
 		const limit = tradePrice(reservation.price);
@@ -608,6 +634,7 @@ export function applyFillToReservations(
 		}
 	}
 	intent.filled = formatCount(filled);
+	intent.dispatch = "started";
 	if (intent.action === "buy") syncBuy(intent);
 	if (intent.action === "sell") syncSell(intent);
 	if (restingCount(intent) === 0n && intent.action === "sell") {
