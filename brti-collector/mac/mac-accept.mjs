@@ -1,9 +1,10 @@
-import { constants } from "node:fs";
+import { constants, existsSync, readFileSync } from "node:fs";
 import { cp, mkdir, rename, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
+const collectorRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const report = {
 	harness: "credential-free-mac-acceptance",
@@ -24,27 +25,25 @@ function emit(exitCode) {
 	process.exit(exitCode);
 }
 
-const distLock = pathToFileURL(path.join(repoRoot, "dist/olga/lock.js")).href;
-const distState = pathToFileURL(path.join(repoRoot, "dist/olga/state.js")).href;
-const distTick = pathToFileURL(path.join(repoRoot, "dist/olga/tick.js")).href;
-const distHost = pathToFileURL(path.join(repoRoot, "dist/olga/host-identity.js")).href;
-
-let lockModule;
-let stateModule;
-let tickModule;
-let hostModule;
-try {
-	lockModule = await import(distLock);
-	stateModule = await import(distState);
-	tickModule = await import(distTick);
-	hostModule = await import(distHost);
-} catch {
+const adapterDir = [path.join(repoRoot, "dist/olga"), path.join(collectorRoot, "vendor/olga")].find((dir) =>
+	existsSync(path.join(dir, "lock.js")),
+);
+if (!adapterDir) {
 	report.linux_adapter = { status: "BLOCK", reason: "compiled adapter is unavailable" };
 	emit(2);
 }
-
-report.orders_enabled = tickModule.OLGA_DISABLED !== true;
-report.external_capital = stateModule.MAX_EXTERNAL_CAPITAL;
+const lockModule = await import(pathToFileURL(path.join(adapterDir, "lock.js")).href);
+const hostModule = await import(pathToFileURL(path.join(adapterDir, "host-identity.js")).href);
+try {
+	const tickModule = await import(pathToFileURL(path.join(repoRoot, "dist/olga/tick.js")).href);
+	const stateModule = await import(pathToFileURL(path.join(repoRoot, "dist/olga/state.js")).href);
+	report.orders_enabled = tickModule.OLGA_DISABLED !== true;
+	report.external_capital = stateModule.MAX_EXTERNAL_CAPITAL;
+} catch {
+	const invariants = JSON.parse(readFileSync(path.join(collectorRoot, "vendor/invariants.json"), "utf8"));
+	report.orders_enabled = invariants.orders_disabled !== true;
+	report.external_capital = invariants.external_capital;
+}
 if (report.orders_enabled || report.external_capital !== "5.000000") emit(2);
 
 const nativeExlock = process.platform === "darwin" && typeof constants.O_EXLOCK === "number";

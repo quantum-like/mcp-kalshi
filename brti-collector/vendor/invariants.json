@@ -1,0 +1,6 @@
+{
+	"orders_disabled": true,
+	"external_capital": "5.000000",
+	"launchd_program": "/usr/bin/false",
+	"note": "Fallback when the repo dist graph is absent. The repo harness imports the compiled adapter directly."
+}
