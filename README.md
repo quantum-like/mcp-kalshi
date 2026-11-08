@@ -161,6 +161,33 @@ pnpm run build
 
 `pnpm test` uses a mocked Axios transport. It does not call Kalshi and it does not prove the exchange accepted an order.
 
+## Profiles
+
+`KALSHI_MCP_PROFILE` defaults to `a1`. That process registers read tools only. Create, cancel, decrease, and batch-cancel are absent from the tool list, and calling those service methods throws before an SDK client exists. The a1 strategy submit function, which is not registered as a tool, checks a fresh price grid and then the persistent ledger before it can call a transport. A disarmed ledger, the default, never reaches that call.
+
+`KALSHI_MCP_PROFILE=a2` is the explicit compatibility profile for the deployed connector. It keeps the 0.1.2 whole-cent create path, including orders that do not carry `price_ranges`. Do not point the running a2 process at this bundle unless that profile is selected on purpose. The default a1 profile will not place those orders.
+
+The Olga candidate in `src/olga/` is a disabled local preparation. Its launchd document is not a schedule and its program is `/usr/bin/false`. The tick can only return `WAIT` or `STOP`. External capital stays 5.000000, realized profits remain usable, and unrealized profit is not spendable. It does not arm the ledger, read a key, or select the a2 profile. See `docs/olga/`.
+
+The offline bundle ships compiled tests. From the extracted directory, with no install and no network:
+
+```bash
+node offline-accept.mjs
+```
+
+That command requests the TAP reporter and also accepts the Node spec summary (`ℹ tests N`). It exits nonzero if it discovers zero tests, a count other than `EXPECTED_TESTS`, or any failing test. It does not call Kalshi.
+
+## A1 readiness (disarmed)
+
+Version 0.1.4 keeps the 0.1.2 acknowledgement text for a2-profile cent orders.
+
+- `READ_BALANCE`, `READ_POSITIONS`, `READ_ORDERS`, `READ_FILLS`, and `READ_SETTLEMENTS` report fixed-point strings, full ids, cursors, and completeness. A missing number is `UNKNOWN`. A failed page is not an empty account.
+- `CREATE_ORDER` accepts an optional `clientOrderId`. Omitting it still generates one id for that call and does not retry. Optional dollar prices require `priceRanges` observed at `priceObservedAt`. Legacy cent fields stay whole cents and are not reinterpreted as dollars.
+- `A1_STRATEGY_STATUS` reports a disarmed $5 ledger. The server does not arm it and does not route `CREATE_ORDER` through it. The ledger cannot stop another API key, the a2 connector, or a manual order from spending the same Kalshi account. `SENATEAK` is refused inside the strategy API only.
+- Sealed-date screening defaults to mode `000` and an empty historical day list. It is not a collector and it does not read market-data files.
+
+Remaining gates before any reconnect: confirm the installed binary hash, compare live positions and pages read-only, keep writes disabled on mismatch, and do not clear an external monitor-only hold. Flat fee series and incomplete account reads halt the strategy. The legacy cent path is not checked against the market tick grid.
+
 ## Deploying this fork
 
 This package is the `quantum-like/mcp-kalshi` fork. It is not published to npm. The parent host installs the self-contained offline bundle, which already contains `dist/` and the production `node_modules` resolved from `pnpm-lock.yaml`.

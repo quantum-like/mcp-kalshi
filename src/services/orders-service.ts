@@ -1,6 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { CreateOrderV2Response, OrdersApi } from "kalshi-typescript";
 import {
+	type GridLimitInput,
+	toGridCreateOrder,
+	usesDollarPrices,
+} from "../orders/price-grid.js";
+import {
+	type McpProfile,
+	assertA2Mutation,
+	resolveProfile,
+} from "../profile.js";
+import {
 	type LegacyCreateInput,
 	toCreateOrderV2,
 } from "./create-order-v2-adapter.js";
@@ -16,7 +26,17 @@ export interface GetOrdersParams {
 	cursor?: string;
 }
 
-export interface CreateOrderParams extends LegacyCreateInput {}
+export interface CreateOrderParams
+	extends LegacyCreateInput,
+		Pick<
+			GridLimitInput,
+			| "yesPriceDollars"
+			| "noPriceDollars"
+			| "priceRanges"
+			| "priceObservedAt"
+			| "now"
+			| "maxMetadataAgeMs"
+		> {}
 
 export interface AmendOrderParams {
 	orderId: string;
@@ -71,6 +91,8 @@ export class OrderMutationClosedError extends Error {
 export interface OrdersServiceOptions {
 	ordersApi?: OrdersApi;
 	createClientOrderId?: () => string;
+	/** Defaults to the process profile, which is a1 unless KALSHI_MCP_PROFILE=a2. */
+	profile?: McpProfile;
 }
 
 const SHARD_DEFAULT_REFUSAL =
@@ -100,10 +122,16 @@ function requireWholeCount(value: number, label: string): number {
 export class OrdersService {
 	private readonly ordersApi: OrdersApi | undefined;
 	private readonly createClientOrderId: () => string;
+	private readonly profile: McpProfile;
 
 	constructor(options: OrdersServiceOptions = {}) {
 		this.ordersApi = options.ordersApi;
 		this.createClientOrderId = options.createClientOrderId ?? randomUUID;
+		this.profile = options.profile ?? resolveProfile();
+	}
+
+	private blockUnlessA2(): void {
+		assertA2Mutation(this.profile);
 	}
 
 	private get orders(): OrdersApi {
@@ -129,7 +157,10 @@ export class OrdersService {
 	}
 
 	async createOrder(params: CreateOrderParams): Promise<CreateOrderV2Response> {
-		const validated = toCreateOrderV2(params);
+		this.blockUnlessA2();
+		const validated = usesDollarPrices(params)
+			? toGridCreateOrder(params)
+			: toCreateOrderV2(params);
 		const clientOrderId = params.clientOrderId ?? this.createClientOrderId();
 		const request = { ...validated, client_order_id: clientOrderId };
 		// Exactly one SDK call. An unknown outcome is not retried.
@@ -138,6 +169,7 @@ export class OrdersService {
 	}
 
 	async cancelOrder(params: CancelOrderParams) {
+		this.blockUnlessA2();
 		const orderId = requireText(params.orderId, "order id");
 		const marketTicker = requireMarketTicker(params.marketTicker);
 		const response = await this.orders.cancelOrderV2(
@@ -150,12 +182,14 @@ export class OrdersService {
 	}
 
 	async amendOrder(_params: AmendOrderParams): Promise<never> {
+		this.blockUnlessA2();
 		throw new OrderMutationClosedError(
 			"AMEND_ORDER is fail-closed. V1 amendOrder was removed. V2 count is the filled-plus-resting total, and a wrong mapping can increase size or lose queue position. No amend tool is exposed.",
 		);
 	}
 
 	async decreaseOrder(params: DecreaseOrderParams) {
+		this.blockUnlessA2();
 		const orderId = requireText(params.orderId, "order id");
 		const marketTicker = requireMarketTicker(params.marketTicker);
 		const reduceBy = requireWholeCount(params.reduceBy, "reduceBy");
@@ -168,12 +202,14 @@ export class OrdersService {
 	}
 
 	async batchCreateOrders(_params: BatchCreateOrdersParams): Promise<never> {
+		this.blockUnlessA2();
 		throw new OrderMutationClosedError(
 			"BATCH_CREATE_ORDERS is fail-closed. It is not an exposed tool. CREATE_ORDER submits exactly one order and does not retry.",
 		);
 	}
 
 	async batchCancelOrders(params: BatchCancelOrdersParams) {
+		this.blockUnlessA2();
 		if (!params.orders?.length) {
 			throw new Error(
 				params.ids?.length

@@ -291,6 +291,7 @@ test("createOrderV2 sends one offline request and preserves a caller id", async 
 	const { calls, api } = ordersApi(async () => ack);
 	let generated = 0;
 	const service = new OrdersService({
+		profile: "a2",
 		ordersApi: api,
 		createClientOrderId: () => {
 			generated += 1;
@@ -327,6 +328,7 @@ test("a generated client id is assigned once and a timeout is not retried", asyn
 	});
 	let generated = 0;
 	const service = new OrdersService({
+		profile: "a2",
 		ordersApi: api,
 		createClientOrderId: () => `id-${++generated}`,
 	});
@@ -350,7 +352,7 @@ test("a generated client id is assigned once and a timeout is not retried", asyn
 
 test("invalid create input performs zero SDK calls", async () => {
 	const { calls, api } = ordersApi(async () => ack);
-	const service = new OrdersService({ ordersApi: api });
+	const service = new OrdersService({ profile: "a2", ordersApi: api });
 	await assert.rejects(
 		service.createOrder({
 			ticker: "MKT",
@@ -376,6 +378,7 @@ test("CREATE_ORDER presents the flat V2 acknowledgement and partial IOC remainde
 	}));
 	const tools = createOrderTools(
 		new OrdersService({
+			profile: "a2",
 			ordersApi: api,
 			createClientOrderId: () => "id-1",
 		}),
@@ -411,7 +414,9 @@ test("CREATE_ORDER presents the flat V2 acknowledgement and partial IOC remainde
 
 test("CREATE_ORDER rejects a market order before any request", async () => {
 	const { calls, api } = ordersApi(async () => ack);
-	const tools = createOrderTools(new OrdersService({ ordersApi: api }));
+	const tools = createOrderTools(
+		new OrdersService({ profile: "a2", ordersApi: api }),
+	);
 	const create = toolByName(tools, "CREATE_ORDER");
 	const text = await create.execute({
 		ticker: "MKT",
@@ -457,7 +462,9 @@ test("cancel auto-routes with the market ticker and does not invent a fill", asy
 		reduced_by: "10.00",
 		ts_ms: 1715793660456,
 	}));
-	const tools = createOrderTools(new OrdersService({ ordersApi: api }));
+	const tools = createOrderTools(
+		new OrdersService({ profile: "a2", ordersApi: api }),
+	);
 	const cancel = toolByName(tools, "CANCEL_ORDER");
 	const text = await cancel.execute({
 		orderId: "ord-1",
@@ -480,7 +487,7 @@ test("cancel and decrease without a market ticker make zero requests", async () 
 	const { calls, api } = ordersApi(async () => {
 		throw new Error("should not be called");
 	});
-	const service = new OrdersService({ ordersApi: api });
+	const service = new OrdersService({ profile: "a2", ordersApi: api });
 	await assert.rejects(
 		service.cancelOrder({ orderId: "ord-1", marketTicker: " " }),
 		/Refusing to default to exchange shard 0/,
@@ -507,7 +514,9 @@ test("decrease sends reduce_by only and presents remaining_count", async () => {
 		remaining_count: "8.00",
 		ts_ms: 1715793680789,
 	}));
-	const tools = createOrderTools(new OrdersService({ ordersApi: api }));
+	const tools = createOrderTools(
+		new OrdersService({ profile: "a2", ordersApi: api }),
+	);
 	const decrease = toolByName(tools, "DECREASE_ORDER");
 	const text = await decrease.execute({
 		orderId: "ord-1",
@@ -528,7 +537,7 @@ test("decrease sends reduce_by only and presents remaining_count", async () => {
 	assert.match(text, /Remaining count: 8\.00/);
 	assert.doesNotMatch(text, /Status:/);
 	await assert.rejects(
-		new OrdersService({ ordersApi: api }).decreaseOrder({
+		new OrdersService({ profile: "a2", ordersApi: api }).decreaseOrder({
 			orderId: "ord-1",
 			reduceBy: 1.5,
 			marketTicker: "MKT",
@@ -554,7 +563,9 @@ test("batch cancel is one request and partial errors stay visible", async () => 
 			},
 		],
 	}));
-	const tools = createOrderTools(new OrdersService({ ordersApi: api }));
+	const tools = createOrderTools(
+		new OrdersService({ profile: "a2", ordersApi: api }),
+	);
 	const batch = toolByName(tools, "BATCH_CANCEL_ORDERS");
 	const text = await batch.execute({
 		orders: [
@@ -584,7 +595,7 @@ test("amend and batch create stay fail-closed with zero requests", async () => {
 	const { calls, api } = ordersApi(async () => {
 		throw new Error("should not be called");
 	});
-	const service = new OrdersService({ ordersApi: api });
+	const service = new OrdersService({ profile: "a2", ordersApi: api });
 	await assert.rejects(
 		service.amendOrder({
 			orderId: "ord-1",
@@ -650,7 +661,9 @@ test("get order and get orders read fixed-point fields", async () => {
 			],
 		};
 	});
-	const tools = createOrderTools(new OrdersService({ ordersApi: api }));
+	const tools = createOrderTools(
+		new OrdersService({ profile: "a2", ordersApi: api }),
+	);
 	const list = await toolByName(tools, "GET_ORDERS").execute({});
 	const detail = await toolByName(tools, "GET_ORDER").execute({
 		orderId: "ord-1",

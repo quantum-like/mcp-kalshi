@@ -1,25 +1,16 @@
 #!/usr/bin/env node
 import { FastMCP } from "fastmcp";
-import { marketTools } from "./tools/markets.js";
-import { orderTools } from "./tools/orders.js";
-import { portfolioTools } from "./tools/portfolio.js";
+import { resolveProfile } from "./profile.js";
+import { toolsForProfile } from "./server-tools.js";
 
 async function main() {
+	const profile = resolveProfile();
 	const server = new FastMCP({
 		name: "Kalshi MCP Server",
-		version: "0.0.1",
+		version: profile === "a2" ? "0.1.2" : "0.1.12",
 	});
 
-	// Register all tools
-	for (const tool of marketTools) {
-		// biome-ignore lint: fastmcp types are overly strict
-		server.addTool(tool as any);
-	}
-	for (const tool of portfolioTools) {
-		// biome-ignore lint: fastmcp types are overly strict
-		server.addTool(tool as any);
-	}
-	for (const tool of orderTools) {
+	for (const tool of toolsForProfile(profile)) {
 		// biome-ignore lint: fastmcp types are overly strict
 		server.addTool(tool as any);
 	}

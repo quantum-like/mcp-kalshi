@@ -1,0 +1,13 @@
+{
+	"name": "@quantumlike/brti-collector",
+	"version": "0.1.3",
+	"private": true,
+	"type": "module",
+	"description": "Separate read-only BRTI hour collector. Not the accepted a1 0.1.12 safety bundle. No order signer. Independent review required before use.",
+	"scripts": {
+		"test": "node --test test/*.test.js"
+	},
+	"engines": {
+		"node": ">=22"
+	}
+}

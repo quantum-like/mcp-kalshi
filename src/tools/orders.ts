@@ -1,5 +1,6 @@
 import dedent from "dedent";
 import { z } from "zod";
+import { toGridCreateOrder, usesDollarPrices } from "../orders/price-grid.js";
 import { toCreateOrderV2 } from "../services/create-order-v2-adapter.js";
 import { OrdersService } from "../services/orders-service.js";
 
@@ -68,7 +69,45 @@ export const createOrderParams = z.object({
 		.max(99)
 		.optional()
 		.describe(
-			"NO limit in whole cents (1-99). Required when side is no. Complemented onto the YES book before submission.",
+			"Legacy NO limit in whole cents (1-99). Required when side is no and dollar prices are omitted. Complemented onto the YES book before submission.",
+		),
+	yesPriceDollars: z
+		.string()
+		.optional()
+		.describe(
+			"Exact YES dollar price. Requires current priceRanges. Omitted cent orders keep the legacy whole-cent path.",
+		),
+	noPriceDollars: z
+		.string()
+		.optional()
+		.describe(
+			"Exact NO dollar price. Requires current priceRanges. The YES-book complement is checked against the same grid.",
+		),
+	priceRanges: z
+		.array(
+			z.object({
+				start: z.string(),
+				end: z.string(),
+				step: z.string(),
+			}),
+		)
+		.optional()
+		.describe(
+			"Current market price_ranges. Required with dollar prices. Absent or stale metadata is rejected.",
+		),
+	priceObservedAt: z
+		.string()
+		.optional()
+		.describe(
+			"ISO time when priceRanges were read. Required with dollar prices.",
+		),
+	clientOrderId: z
+		.string()
+		.min(1)
+		.max(64)
+		.optional()
+		.describe(
+			"Stable caller idempotency key. If omitted, one new id is generated for this call only and is not recovered after a crash. The call is still not retried.",
 		),
 	timeInForce: z
 		.enum(["fill_or_kill", "good_till_canceled", "immediate_or_cancel"])
@@ -208,11 +247,12 @@ export function createOrderTools(ordersService = new OrdersService()) {
 	const createOrderTool = {
 		name: "CREATE_ORDER",
 		description:
-			"Create one limit order. YES/NO buy/sell prices in whole cents are mapped onto the YES book as a fixed-point dollar price. Market orders are rejected. The call is not retried. The response is an acknowledgement, not a resting-order snapshot.",
+			"Create one limit order. Legacy whole-cent YES/NO prices are mapped onto the YES book. Optional dollar prices require current priceRanges and are rejected when that grid is missing or stale. Optional clientOrderId is kept for this call; omitting it generates a new id and does not retry. The response is an acknowledgement, not a resting-order snapshot.",
 		parameters: createOrderParams,
 		execute: async (params: z.infer<typeof createOrderParams>) => {
 			try {
-				const result = await ordersService.createOrder({
+				const now = new Date();
+				const order = {
 					ticker: params.ticker,
 					side: params.side,
 					action: params.action,
@@ -220,24 +260,21 @@ export function createOrderTools(ordersService = new OrdersService()) {
 					type: params.type,
 					yesPrice: params.yesPrice,
 					noPrice: params.noPrice,
+					yesPriceDollars: params.yesPriceDollars,
+					noPriceDollars: params.noPriceDollars,
+					priceRanges: params.priceRanges,
+					priceObservedAt: params.priceObservedAt,
 					timeInForce: params.timeInForce,
 					expirationTs: params.expirationTs,
 					postOnly: params.postOnly,
 					reduceOnly: params.reduceOnly,
-				});
-				const submitted = toCreateOrderV2({
-					ticker: params.ticker,
-					side: params.side,
-					action: params.action,
-					count: params.count,
-					type: params.type,
-					yesPrice: params.yesPrice,
-					noPrice: params.noPrice,
-					timeInForce: params.timeInForce,
-					expirationTs: params.expirationTs,
-					postOnly: params.postOnly,
-					reduceOnly: params.reduceOnly,
-				});
+					clientOrderId: params.clientOrderId,
+					now,
+				};
+				const result = await ordersService.createOrder(order);
+				const submitted = usesDollarPrices(order)
+					? toGridCreateOrder(order)
+					: toCreateOrderV2(order);
 				return dedent`
 					Order acknowledgement received. This is not a fill or status guarantee.
 
