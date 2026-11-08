@@ -151,8 +151,18 @@ export async function inspectHour(root, iso) {
 	}
 	if (complete.files && typeof complete.files === "object") {
 		for (const [name, hash] of Object.entries(complete.files)) {
-			if (typeof hash !== "string") halt("integrity_incident", "Stored file hash is unreadable.");
-			const bytes = await readFileBytes(path.join(directory, name));
+			if (typeof hash !== "string" || name.includes("..") || name.includes("/")) {
+				halt("integrity_incident", "Stored file hash is unreadable.");
+			}
+			let bytes;
+			try {
+				bytes = await readFileBytes(path.join(directory, name));
+			} catch (error) {
+				if (error?.code === "ENOENT") {
+					halt("integrity_incident", "A persisted hour artifact named by the completion record is missing.");
+				}
+				throw error;
+			}
 			if (sha256(bytes) !== hash) {
 				halt("integrity_incident", "A persisted hour artifact does not match its recorded hash.");
 			}

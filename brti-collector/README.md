@@ -1,4 +1,9 @@
-# Read-only BRTI collector 0.1.1
+# Read-only BRTI collector
+
+Package 0.1.2 adds the offline alignment pipeline and the credential-free Mac
+harness. Collector 0.1.1 remains the reviewed offline archive. That review
+accepted the offline code and said credential-free Mac acceptance is not
+suitable. This package does not replace that verdict.
 
 This package is not the accepted a1 0.1.12 safety bundle. That archive stays
 `iqai-mcp-kalshi-0.1.12-offline-bundle.tgz`, 7430643 bytes, SHA256
