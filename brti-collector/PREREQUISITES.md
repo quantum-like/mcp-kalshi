@@ -1,6 +1,6 @@
 # Prerequisites for disabled Olga acceptance
 
-These are prerequisites, not a live authorization and not a fresh BRTI certificate.
+What is already implemented and tested is in `INTEGRATION.md`. The items below are still outside this repository. These are prerequisites, not a live authorization and not a fresh BRTI certificate.
 
 The independent collector 0.1.1 review is **offline code ACCEPT** and **credential-free Mac acceptance NOT SUITABLE**. This later harness does not replace that review and does not claim Mac acceptance. Linux packaged 0.1.12 remains 74 pass and is not Mac acceptance.
 
