@@ -1,4 +1,4 @@
-import { sanitize, halt } from "./errors.js";
+import { createRedactor, halt } from "./errors.js";
 import { ORIGIN, authHeaders, historyQuery, HISTORY_PATH, KEYS_PATH } from "./sign.js";
 
 export const MAX_BODY_BYTES = 10 * 1024 * 1024;
@@ -43,15 +43,31 @@ export function allowlistedUrl(path, query = "") {
 	return url;
 }
 
-function shortDetail(payload) {
+function publicDetail(payload, redact) {
+	if (typeof payload === "string") return redact.text(payload);
 	if (typeof payload !== "object" || payload === null) return "";
-	const candidates = [payload.detail, payload.message, payload.error?.code, payload.error?.message];
-	for (const candidate of candidates) {
-		if (typeof candidate === "string" && candidate.length > 0 && candidate.length <= 200) {
-			return sanitize(candidate);
+	return redact.text(collectPublicText(payload));
+}
+
+function collectPublicText(value) {
+	const parts = [];
+	const seen = new Set();
+	function walk(item, depth) {
+		if (item == null || depth > 8) return;
+		if (typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+			parts.push(String(item));
+			return;
 		}
+		if (typeof item !== "object" || seen.has(item)) return;
+		seen.add(item);
+		if (Array.isArray(item)) {
+			for (const nested of item) walk(nested, depth + 1);
+			return;
+		}
+		for (const nested of Object.values(item)) walk(nested, depth + 1);
 	}
-	return "";
+	walk(value, 0);
+	return parts.join(" ");
 }
 
 function retryWaitMs(attemptIndex, retryAfterMs, jitterMs) {
@@ -69,6 +85,11 @@ export function createKalshiClient({ credentials, clock, limiter, fetchImpl, jit
 		const started = await limiter.acquire();
 		const authMs = clock.now();
 		const headers = authHeaders(credentials.keyId, credentials.key, authMs, path);
+		const redact = createRedactor([
+			credentials.keyId,
+			headers["KALSHI-ACCESS-SIGNATURE"],
+			headers["KALSHI-ACCESS-KEY"],
+		]);
 		const url = allowlistedUrl(path, query);
 		let response;
 		try {
@@ -86,7 +107,7 @@ export function createKalshiClient({ credentials, clock, limiter, fetchImpl, jit
 				authMs,
 				retry: true,
 				code: "network",
-				detail: sanitize(error instanceof Error ? error.message : "network"),
+				detail: redact.error(error),
 			};
 		}
 		if (response?.redirected || (response?.status >= 300 && response?.status < 400)) {
@@ -99,13 +120,14 @@ export function createKalshiClient({ credentials, clock, limiter, fetchImpl, jit
 		if (bytes.length > 0) {
 			try {
 				parsed = JSON.parse(bytes.toString("utf8"));
-				detail = shortDetail(parsed);
+				if (response.status !== 200) detail = publicDetail(parsed, redact);
 			} catch {
 				parsed = null;
+				if (response.status !== 200) detail = redact.text(bytes.toString("utf8"));
 			}
 		}
 		const decision = classifyStatus(response.status, detail);
-		if (decision.action === "halt") halt(decision.code, detail || decision.code);
+		if (decision.action === "halt") halt(decision.code, redact.text(detail || decision.code));
 		return {
 			started,
 			authMs,
@@ -131,7 +153,10 @@ export function createKalshiClient({ credentials, clock, limiter, fetchImpl, jit
 			});
 			if (!result.retry) return { ...result, attempts };
 			if (attempt === MAX_ATTEMPTS) {
-				halt("hour_missing", "Transient failures exhausted the attempt budget.");
+				halt(
+					"hour_missing",
+					`Transient failures exhausted the attempt budget. ${result.detail ?? ""}`,
+				);
 			}
 			const wait = retryWaitMs(attempt, result.retryAfterMs, jitter(attempt));
 			await clock.sleep(wait);

@@ -1,4 +1,4 @@
-# Read-only BRTI collector
+# Read-only BRTI collector 0.1.1
 
 This package is not the accepted a1 0.1.12 safety bundle. That archive stays
 `iqai-mcp-kalshi-0.1.12-offline-bundle.tgz`, 7430643 bytes, SHA256
@@ -13,6 +13,12 @@ only. It does not grant a live GO.
 Provisional Coinbase discrepancy numbers and the 100 bp return flag are
 recorded and are not a certification threshold. A clean cadence still writes
 `certification: NOT_CERTIFIED` and does not write `CERTIFIED.json`.
+
+Provider error text, nested causes, and transport exceptions are redacted for
+the exact key id, including short ids and UUIDs, plus URL and base64 forms.
+A restart checks every persisted hour artifact against its hash and halts on
+a mismatch. It does not repair or certify the hour. The request host stays
+`https://external-api.kalshi.com`.
 
 Linux `node:sqlite` exclusive lock is not macOS `O_EXLOCK`. This host cannot
 attest Olga storage. `olga-local` is refused here. Tests use a temp directory

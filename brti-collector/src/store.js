@@ -128,11 +128,65 @@ export async function inspectHour(root, iso) {
 	if (sha256(response) !== recorded) {
 		halt("integrity_incident", "Stored hour hash does not match its bytes.");
 	}
-	const complete = JSON.parse(marker.toString("utf8"));
+	let complete;
+	try {
+		complete = JSON.parse(marker.toString("utf8"));
+	} catch {
+		halt("integrity_incident", "Completion marker is unreadable.");
+	}
 	if (complete.response_sha256 !== recorded) {
 		halt("integrity_incident", "Completion marker does not match the stored hash.");
 	}
+	if (complete.certification !== "NOT_CERTIFIED" && complete.certification !== "REJECTED") {
+		halt("integrity_incident", "Completion marker is not a fail-closed certification result.");
+	}
+	let provenance;
+	try {
+		provenance = JSON.parse((await readFileBytes(path.join(directory, "provenance.json"))).toString("utf8"));
+	} catch {
+		halt("integrity_incident", "Provenance is unreadable.");
+	}
+	if (provenance.certification !== complete.certification || provenance.certification === "CERTIFIED") {
+		halt("integrity_incident", "Provenance certification does not match the fail-closed marker.");
+	}
+	if (complete.files && typeof complete.files === "object") {
+		for (const [name, hash] of Object.entries(complete.files)) {
+			if (typeof hash !== "string") halt("integrity_incident", "Stored file hash is unreadable.");
+			const bytes = await readFileBytes(path.join(directory, name));
+			if (sha256(bytes) !== hash) {
+				halt("integrity_incident", "A persisted hour artifact does not match its recorded hash.");
+			}
+		}
+	}
+	await verifySidecar(directory, "deduped.json", "deduped.sha256");
+	await verifySidecar(directory, "REJECTED.json", "REJECTED.sha256");
 	return { status: "match", directory, sha256: recorded };
+}
+
+async function verifySidecar(directory, name, hashName) {
+	const file = path.join(directory, name);
+	const hashFile = path.join(directory, hashName);
+	const hasFile = await fileExists(file);
+	const hasHash = await fileExists(hashFile);
+	if (!hasFile && !hasHash) return;
+	if (!hasFile || !hasHash) {
+		halt("integrity_incident", "A persisted sidecar is missing its hash.");
+	}
+	const bytes = await readFileBytes(file);
+	const recorded = (await readFileBytes(hashFile)).toString("utf8").trim();
+	if (sha256(bytes) !== recorded) {
+		halt("integrity_incident", "A persisted sidecar does not match its hash.");
+	}
+}
+
+async function fileExists(file) {
+	try {
+		await lstat(file);
+		return true;
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		throw error;
+	}
 }
 
 export async function commitHour({
@@ -160,15 +214,23 @@ export async function commitHour({
 		await mkdir(staging, { recursive: true, mode: 0o700 });
 		await chmod(staging, 0o700);
 		const responseHash = sha256(responseBytes);
+		const responseShaBytes = Buffer.from(`${responseHash}\n`);
+		const provenanceBytes = Buffer.from(`${JSON.stringify(provenance)}\n`);
+		const files = {
+			"response.json": responseHash,
+			"response.sha256": sha256(responseShaBytes),
+			"provenance.json": sha256(provenanceBytes),
+		};
 		await writeExclusive(path.join(staging, "response.json"), responseBytes);
-		await writeExclusive(path.join(staging, "response.sha256"), Buffer.from(`${responseHash}\n`));
-		await writeExclusive(path.join(staging, "provenance.json"), Buffer.from(`${JSON.stringify(provenance)}\n`));
+		await writeExclusive(path.join(staging, "response.sha256"), responseShaBytes);
+		await writeExclusive(path.join(staging, "provenance.json"), provenanceBytes);
+		let dedupedShaBytes = null;
 		if (dedupedBytes) {
+			dedupedShaBytes = Buffer.from(`${sha256(dedupedBytes)}\n`);
+			files["deduped.json"] = sha256(dedupedBytes);
+			files["deduped.sha256"] = sha256(dedupedShaBytes);
 			await writeExclusive(path.join(staging, "deduped.json"), dedupedBytes);
-			await writeExclusive(
-				path.join(staging, "deduped.sha256"),
-				Buffer.from(`${sha256(dedupedBytes)}\n`),
-			);
+			await writeExclusive(path.join(staging, "deduped.sha256"), dedupedShaBytes);
 		}
 		await fsyncDirectory(staging);
 		await boundary(crashBefore, "after-staging");
@@ -188,12 +250,17 @@ export async function commitHour({
 		}
 		await boundary(crashBefore, "after-link");
 		if (rejectedBytes) {
+			const rejectedShaBytes = Buffer.from(`${sha256(rejectedBytes)}\n`);
+			files["REJECTED.json"] = sha256(rejectedBytes);
+			files["REJECTED.sha256"] = sha256(rejectedShaBytes);
 			await writeExclusive(path.join(finalDirectory, "REJECTED.json"), rejectedBytes);
+			await writeExclusive(path.join(finalDirectory, "REJECTED.sha256"), rejectedShaBytes);
 		}
 		const marker = {
 			ingestion: "durable",
 			certification: provenance.certification,
 			response_sha256: responseHash,
+			files,
 		};
 		await writeExclusive(path.join(finalDirectory, "COMPLETE.json"), Buffer.from(`${JSON.stringify(marker)}\n`));
 		await fsyncDirectory(finalDirectory);

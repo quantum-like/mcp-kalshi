@@ -5,7 +5,7 @@ import { halt } from "./errors.js";
 export const EXPECTED_ROWS = 18_000;
 export const MAX_ROWS = 25_000;
 export const PROVISIONAL_RETURN_BP = 100;
-export const SPEC_VERSION = "brti-collector-0.1.0";
+export const SPEC_VERSION = "brti-collector-0.1.1";
 
 export function decimalToE8(value) {
 	if (typeof value !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d{1,8})?$/.test(value)) return null;
